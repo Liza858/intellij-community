@@ -1,6 +1,7 @@
 // Copyright 2000-2022 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
 package com.intellij.rt.debugger.agent;
 
+import com.intellij.rt.debugger.agent.util.CollectionMethodsWrapper;
 import org.jetbrains.capture.org.objectweb.asm.*;
 import org.jetbrains.capture.org.objectweb.asm.commons.LocalVariablesSorter;
 import org.jetbrains.capture.org.objectweb.asm.tree.*;
@@ -77,6 +78,8 @@ public class CollectionBreakpointInstrumentor {
     collectionKnownMethods.add(new ImmutableMethod("hashCode()I"));
     collectionKnownMethods.add(new ReturnsBooleanMethod("add(Ljava/lang/Object;)Z", true));
     collectionKnownMethods.add(new ReturnsBooleanMethod("remove(Ljava/lang/Object;)Z", false));
+    collectionKnownMethods.add(new AddAllMethod());
+    collectionKnownMethods.add(new RemoveAllMethod());
     myKnownMethods.put(COLLECTION_TYPE, collectionKnownMethods);
 
     KnownMethodsSet abstractCollectionKnownMethods = new KnownMethodsSet();
@@ -164,7 +167,8 @@ public class CollectionBreakpointInstrumentor {
   }
 
   @SuppressWarnings("unused")
-  public static void captureCollectionModification(Multiset oldElements, Object newCollectionInstance) {
+  public static void captureCollectionModification(Multiset oldElements,
+                                                   Object newCollectionInstance) {
     try {
       CollectionInstanceLock lock = myInstanceFilters.get(newCollectionInstance);
       if (oldElements == null || lock == null) {
@@ -461,6 +465,10 @@ public class CollectionBreakpointInstrumentor {
     return getInternalClsName(CollectionBreakpointInstrumentor.class);
   }
 
+  private static String getCollectionMethodsWrapperClassName() {
+    return getInternalClsName(CollectionMethodsWrapper.class);
+  }
+
   public static String getInternalClsName(String typeDescriptor) {
     return Type.getType(typeDescriptor).getInternalName();
   }
@@ -538,36 +546,51 @@ public class CollectionBreakpointInstrumentor {
                                      final String desc,
                                      final String signature,
                                      final String[] exceptions) {
-      MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
+      MethodVisitor superMethodVisitor = super.visitMethod(access, name, desc, signature, exceptions);
 
       boolean isBridgeMethod = (access & Opcodes.ACC_BRIDGE) != 0;
 
       if (!isBridgeMethod && name != null && desc != null) {
         if (myClassesToTransform.contains(myClsName)) {
-          mv = new CaptureFieldsMethodVisitor(api, mv);
+          return new CaptureFieldsMethodVisitor(api, superMethodVisitor);
         }
 
         boolean isNonStaticMethod = (access & Opcodes.ACC_STATIC) == 0;
+        boolean isNonPrivateMethod = (access & Opcodes.ACC_PRIVATE) == 0;
         boolean isNonSynthetic = (access & Opcodes.ACC_SYNTHETIC) == 0;
         boolean isConstructor = name.equals(CONSTRUCTOR_METHOD_NAME);
 
-        if (isNonStaticMethod && isNonSynthetic && !isConstructor &&
+        if (isNonStaticMethod && isNonPrivateMethod &&
+            isNonSynthetic && !isConstructor &&
             myCollectionsToTransform.containsKey(myClsName)) {
-          CollectionMethodVisitor collectionMethodVisitor = new CollectionMethodVisitor(api, access, name, desc, mv);
-          mv = new TryCatchAdapter(api, access, name, desc, signature, exceptions, collectionMethodVisitor);
+          return getCollectionMethodVisitor(access, name, desc, signature, exceptions, superMethodVisitor);
         }
       }
 
-      return mv;
+      return superMethodVisitor;
     }
 
-    private boolean shouldCaptureModifications(String methodFullDesc) {
+    private MethodVisitor getCollectionMethodVisitor(final int access,
+                                                     final String name,
+                                                     final String desc,
+                                                     final String signature,
+                                                     final String[] exceptions,
+                                                     MethodVisitor superMethodVisitor) {
+      KnownMethod method = null;
       KnownMethodsSet knownMethods = myCollectionsToTransform.get(myClsName);
-      if (knownMethods == null) {
-        return false;
+      if (knownMethods != null) {
+        method = knownMethods.get(name + desc);
       }
-      KnownMethod method = knownMethods.get(methodFullDesc);
-      return method == null || method.isMutable();
+
+      if (method instanceof ImmutableMethod) {
+        return superMethodVisitor;
+      }
+      else if (method instanceof ReplacableMethod) {
+        return ((ReplacableMethod)method).getMethodVisitor(api, superMethodVisitor);
+      }
+
+      CollectionMethodVisitor mv = new CollectionMethodVisitor(api, access, name, desc, superMethodVisitor, method);
+      return new TryCatchAdapter(api, access, name, desc, signature, exceptions, mv);
     }
 
     private boolean shouldOptimizeCapture(String methodFullDesc) {
@@ -600,9 +623,7 @@ public class CollectionBreakpointInstrumentor {
       @Override
       public void visitEnd() {
         super.visitEnd();
-        if (shouldCaptureModifications(myMethodFullDesc)) {
-          addTryCatchCode();
-        }
+        addTryCatchCode();
         accept(mv);
       }
 
@@ -645,31 +666,36 @@ public class CollectionBreakpointInstrumentor {
 
     private class CollectionMethodVisitor extends LocalVariablesSorter {
       private final String myMethodFullDesc;
+      private final KnownMethod myDelegate;
       private int myCollectionCopyVar;
       private int myShouldCaptureVar;
       private int myAdditionalStackSpace = 0;
       private int myNumberOfAdditionalLocalVars = 0;
 
-      protected CollectionMethodVisitor(int api, int access, String name, String descriptor, MethodVisitor methodVisitor) {
+      protected CollectionMethodVisitor(int api,
+                                        int access,
+                                        String name,
+                                        String descriptor,
+                                        MethodVisitor methodVisitor,
+                                        KnownMethod delegate) {
         super(api, access, descriptor, methodVisitor);
         myMethodFullDesc = name + descriptor;
+        myDelegate = delegate;
       }
 
       @Override
       public void visitCode() {
         super.visitCode();
-        if (shouldCaptureModifications(myMethodFullDesc)) {
-          addStartCaptureCode();
+        addStartCaptureCode();
 
-          if (!shouldOptimizeCapture(myMethodFullDesc)) {
-            addCaptureCollectionCopyCode();
-          }
+        if (!shouldOptimizeCapture(myMethodFullDesc)) {
+          addCaptureCollectionCopyCode();
         }
       }
 
       @Override
       public void visitInsn(int opcode) {
-        if (shouldCaptureModifications(myMethodFullDesc) && isReturnInstruction(opcode)) {
+        if (isReturnInstruction(opcode)) {
           addCaptureCollectionModificationCode();
           addEndCaptureCode();
         }
@@ -732,13 +758,11 @@ public class CollectionBreakpointInstrumentor {
       }
 
       private void addCaptureCollectionModificationCode() {
-        KnownMethodsSet knownMethods = myCollectionsToTransform.get(myClsName);
-        KnownMethod knownMethod = knownMethods.get(myMethodFullDesc);
-        if (knownMethod == null) {
+        if (myDelegate == null || !(myDelegate instanceof OptimizedMethod)) {
           addCaptureCollectionModificationDefaultCode();
         }
         else {
-          myAdditionalStackSpace += knownMethod.addCaptureModificationCode(mv, myShouldCaptureVar);
+          myAdditionalStackSpace += ((OptimizedMethod)myDelegate).addCaptureModificationCode(mv, myShouldCaptureVar);
         }
       }
     }
@@ -1024,18 +1048,10 @@ public class CollectionBreakpointInstrumentor {
 
   private abstract static class KnownMethod {
     private final String myMethodFullDesc;
-    private final boolean myIsMutable;
 
-    private KnownMethod(String desc, boolean mutable) {
+    private KnownMethod(String desc) {
       myMethodFullDesc = desc;
-      myIsMutable = mutable;
     }
-
-    private boolean isMutable() {
-      return myIsMutable;
-    }
-
-    abstract public int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar);
 
     @Override
     public boolean equals(Object obj) {
@@ -1050,20 +1066,83 @@ public class CollectionBreakpointInstrumentor {
 
   private static class ImmutableMethod extends KnownMethod {
     private ImmutableMethod(String desc) {
-      super(desc, false);
-    }
-
-    @Override
-    public int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
-      return 0;
+      super(desc);
     }
   }
 
-  private static class ReturnsBooleanMethod extends KnownMethod {
+  private static abstract class OptimizedMethod extends KnownMethod {
+    private OptimizedMethod(String desc) {
+      super(desc);
+    }
+
+    public abstract int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar);
+  }
+
+  private static abstract class ReplacableMethod extends KnownMethod {
+    private ReplacableMethod(String desc) {
+      super(desc);
+    }
+
+    public abstract MethodVisitor getMethodVisitor(int api, MethodVisitor superMethodVisitor);
+  }
+
+  private static class AddAllMethod extends ReplacableMethod {
+    private AddAllMethod() {
+      super("addAll(Ljava/util/Collection;)Z");
+    }
+
+    @Override
+    public MethodVisitor getMethodVisitor(int api, final MethodVisitor superMethodVisitor) {
+      return new MethodVisitor(api) {
+        @Override
+        public void visitCode() {
+          superMethodVisitor.visitCode();
+          superMethodVisitor.visitVarInsn(Opcodes.ALOAD, 0);
+          superMethodVisitor.visitVarInsn(Opcodes.ALOAD, 1);
+          superMethodVisitor.visitMethodInsn(Opcodes.INVOKESTATIC,
+                                             getCollectionMethodsWrapperClassName(),
+                                             "addAll",
+                                             "(Ljava/util/Collection;Ljava/util/Collection;)Z",
+                                             false);
+          superMethodVisitor.visitInsn(Opcodes.IRETURN);
+          superMethodVisitor.visitMaxs(2, 0);
+          superMethodVisitor.visitEnd();
+        }
+      };
+    }
+  }
+
+  private static class RemoveAllMethod extends ReplacableMethod {
+    private RemoveAllMethod() {
+      super("removeAll(Ljava/util/Collection;)Z");
+    }
+
+    @Override
+    public MethodVisitor getMethodVisitor(int api, final MethodVisitor superMethodVisitor) {
+      return new MethodVisitor(api) {
+        @Override
+        public void visitCode() {
+          superMethodVisitor.visitCode();
+          superMethodVisitor.visitVarInsn(Opcodes.ALOAD, 0);
+          superMethodVisitor.visitVarInsn(Opcodes.ALOAD, 1);
+          superMethodVisitor.visitMethodInsn(Opcodes.INVOKESTATIC,
+                                             getCollectionMethodsWrapperClassName(),
+                                             "removeAll",
+                                             "(Ljava/util/Collection;Ljava/util/Collection;)Z",
+                                             false);
+          superMethodVisitor.visitInsn(Opcodes.IRETURN);
+          superMethodVisitor.visitMaxs(2, 0);
+          superMethodVisitor.visitEnd();
+        }
+      };
+    }
+  }
+
+  private static class ReturnsBooleanMethod extends OptimizedMethod {
     private final boolean myIsAddition;
 
     private ReturnsBooleanMethod(String desc, boolean isAddition) {
-      super(desc, true);
+      super(desc);
       myIsAddition = isAddition;
     }
 
@@ -1084,9 +1163,9 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  private static class PutMethod extends KnownMethod {
+  private static class PutMethod extends OptimizedMethod {
     private PutMethod() {
-      super("put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", true);
+      super("put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
     }
 
     @Override
@@ -1122,9 +1201,9 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  private static class RemoveKeyMethod extends KnownMethod {
+  private static class RemoveKeyMethod extends OptimizedMethod {
     private RemoveKeyMethod() {
-      super("remove(Ljava/lang/Object;)Ljava/lang/Object;", true);
+      super("remove(Ljava/lang/Object;)Ljava/lang/Object;");
     }
 
     @Override
