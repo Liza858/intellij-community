@@ -57,11 +57,9 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   private static final String PUT_FIELD_TO_CAPTURE_METHOD_NAME = "putFieldToCapture";
   private static final String PUT_FIELD_TO_CAPTURE_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;)V";
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
-  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC =
-    "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
+  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
-  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC =
-    "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
+  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME = "captureCollectionModification";
   private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC = "(ZZLjava/lang/Object;Ljava/lang/Object;Z)V";
 

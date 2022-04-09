@@ -23,6 +23,7 @@ public class CollectionBreakpointInstrumentor {
   private static final String STRING_TYPE = "Ljava/lang/String;";
   private static final String MULTISET_TYPE = "Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;";
   private static final String PAIR_TYPE = "Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Pair;";
+  private static final String IDENTITY_MAP_TYPE = "Ljava/util/IdentityHashMap;";
   private static final String COLLECTION_TYPE = "java/util/Collection";
   private static final String MAP_TYPE = "java/util/Map";
   private static final String ABSTRACT_COLLECTION_TYPE = "java/util/AbstractCollection";
@@ -35,11 +36,17 @@ public class CollectionBreakpointInstrumentor {
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(" + OBJECT_TYPE + OBJECT_TYPE + STRING_TYPE + STRING_TYPE + "Z)V";
   private static final String ON_CAPTURE_START_METHOD_NAME = "onCaptureStart";
-  private static final String ON_CAPTURE_START_METHOD_DESC = "(" + OBJECT_TYPE + "Z)Z";
+  private static final String ON_CAPTURE_START_DEFAULT_METHOD_DESC = "(" + OBJECT_TYPE + "Z)Z";
+  private static final String ON_CAPTURE_START_NESTED_CLS_METHOD_DESC = "(" + OBJECT_TYPE + IDENTITY_MAP_TYPE + IDENTITY_MAP_TYPE + ")V";
   private static final String ON_CAPTURE_END_METHOD_NAME = "onCaptureEnd";
-  private static final String ON_CAPTURE_END_METHOD_DESC = "(" + OBJECT_TYPE + "Z)V";
+  private static final String ON_CAPTURE_END_DEFAULT_METHOD_DESC = "(" + OBJECT_TYPE + "Z)V";
+  private static final String ON_CAPTURE_END_NESTED_CLS_METHOD_DESC = "(" + IDENTITY_MAP_TYPE + IDENTITY_MAP_TYPE + ")V";
   private static final String CAPTURE_COLLECTION_COPY_METHOD_NAME = "captureCollectionCopy";
   private static final String CAPTURE_COLLECTION_COPY_METHOD_DESC = "(" + "Z" + OBJECT_TYPE + ")" + MULTISET_TYPE;
+  private static final String GET_COPIES_OF_COLLECTION_MAP_METHOD_NAME = "getCopiesOfCollectionsMap";
+  private static final String GET_COPIES_OF_COLLECTION_MAP_METHOD_DESC = "()" + IDENTITY_MAP_TYPE;
+  private static final String GET_NUMBER_OF_START_CAPTURE_METHOD_NAME = "getNumberOfStartCaptureCallsMap";
+  private static final String GET_NUMBER_OF_START_CAPTURE_METHOD_DESC = "()" + IDENTITY_MAP_TYPE;
   private static final String CONSTRUCTOR_METHOD_NAME = "<init>";
   private static final String CREATE_PAIR_METHOD_NAME = "createPair";
   private static final String CREATE_PAIR_METHOD_DESC = "(" + OBJECT_TYPE + OBJECT_TYPE + ")" + PAIR_TYPE;
@@ -55,6 +62,8 @@ public class CollectionBreakpointInstrumentor {
 
   private static final Set<String> myUnprocessedNestedMembers = new HashSet<String>();
   private static final Map<String, KnownMethodsSet> myCollectionsToTransform = new HashMap<String, KnownMethodsSet>();
+
+  private static final Map<String, String> myNestedCollectionMembers = new HashMap<String, String>();
   private static final Set<String> myClassesToTransform = new HashSet<String>();
   private static final ReentrantLock myTransformLock = new ReentrantLock();
 
@@ -199,11 +208,54 @@ public class CollectionBreakpointInstrumentor {
   }
 
   @SuppressWarnings("unused")
+  public static void onCaptureStart(Object collectionInstance,
+                                    IdentityHashMap<Object, Multiset> copiesOfCollections,
+                                    IdentityHashMap<Object, Integer> methodEntryNumbers) {
+    try {
+      CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
+      if (lock == null) {
+        return;
+      }
+      methodEntryNumbers.put(collectionInstance, lock.getMethodEnterNumber());
+      boolean shouldCapture = lock.lock(true);
+      Multiset copy = captureCollectionCopy(shouldCapture, collectionInstance);
+      if (copy != null && !copiesOfCollections.containsKey(collectionInstance)) {
+        copiesOfCollections.put(collectionInstance, copy);
+      }
+    }
+    catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
+
+  @SuppressWarnings("unused")
   public static void onCaptureEnd(Object collectionInstance, boolean shouldSynchronized) {
     try {
       CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
       if (lock != null) {
         lock.unlock(shouldSynchronized);
+      }
+    }
+    catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
+
+  @SuppressWarnings("unused")
+  public static void onCaptureEnd(IdentityHashMap<Object, Multiset> copiesOfCollections,
+                                  IdentityHashMap<Object, Integer> methodEntryNumbers) {
+    try {
+      for (Map.Entry<Object, Multiset> entry : copiesOfCollections.entrySet()) {
+        Object collectionInstance = entry.getKey();
+        CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
+        if (lock == null) {
+          continue;
+        }
+        Multiset oldCollectionElements = entry.getValue();
+        captureCollectionModification(oldCollectionElements, collectionInstance);
+        lock.unlock(true);
+        Integer methodEntryNumber = methodEntryNumbers.get(collectionInstance);
+        lock.setMethodEnterNumber(methodEntryNumber);
       }
     }
     catch (Exception e) {
@@ -285,6 +337,28 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
+  @SuppressWarnings("unused")
+  public static IdentityHashMap<Object, Multiset> getCopiesOfCollectionsMap() {
+    try {
+      return new IdentityHashMap<Object, Multiset>();
+    }
+    catch (Exception e) {
+      e.printStackTrace();
+      return null;
+    }
+  }
+
+  @SuppressWarnings("unused")
+  public static IdentityHashMap<Object, Integer> getNumberOfStartCaptureCallsMap() {
+    try {
+      return new IdentityHashMap<Object, Integer>();
+    }
+    catch (Exception e) {
+      e.printStackTrace();
+      return null;
+    }
+  }
+
   private static void transformClassToCaptureFields(String qualifiedClsName) {
     try {
       myTransformLock.lock();
@@ -315,9 +389,9 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  private static void transformCollectionNestedMembers() {
+  private static void transformCollectionNestedMembers(String internalClsName) {
     for (String nestedName : myUnprocessedNestedMembers) {
-      myCollectionsToTransform.put(nestedName, new KnownMethodsSet());
+      myNestedCollectionMembers.put(nestedName, internalClsName);
     }
     Set<String> nestedNames = new HashSet<String>(myUnprocessedNestedMembers);
     myUnprocessedNestedMembers.clear();
@@ -415,8 +489,8 @@ public class CollectionBreakpointInstrumentor {
   private static void transformCollectionClassIfNeeded(Class<?> cls) {
     try {
       myTransformLock.lock();
-      String qualifiedClassName = getInternalClsName(cls);
-      if (myCollectionsToTransform.containsKey(qualifiedClassName)) {
+      String internalClsName = getInternalClsName(cls);
+      if (myCollectionsToTransform.containsKey(internalClsName)) {
         return;
       }
 
@@ -435,7 +509,7 @@ public class CollectionBreakpointInstrumentor {
         }
       }
 
-      transformCollectionNestedMembers();
+      transformCollectionNestedMembers(internalClsName);
     }
     catch (Exception e) {
       e.printStackTrace();
@@ -493,7 +567,11 @@ public class CollectionBreakpointInstrumentor {
         return null;
       }
 
-      if (myCollectionsToTransform.containsKey(className) || myClassesToTransform.contains(className)) {
+      boolean shouldBeTransformed = myCollectionsToTransform.containsKey(className) ||
+                                    myNestedCollectionMembers.containsKey(className) ||
+                                    myClassesToTransform.contains(className);
+
+      if (shouldBeTransformed) {
         try {
           ClassReader reader = new ClassReader(classfileBuffer);
           ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES);
@@ -530,10 +608,7 @@ public class CollectionBreakpointInstrumentor {
         myUnprocessedNestedMembers.add(name); // save for processing after transform
       }
 
-      boolean isNonStatic = (access & Opcodes.ACC_STATIC) == 0;
-      boolean shouldProcess = myCollectionsToTransform.containsKey(myClsName) && !myCollectionsToTransform.containsKey(name);
-
-      if (isNonStatic && shouldProcess) {
+      if (myCollectionsToTransform.containsKey(myClsName) && !myNestedCollectionMembers.containsKey(name)) {
         myUnprocessedNestedMembers.add(name); // save for processing after transform
       }
 
@@ -546,28 +621,31 @@ public class CollectionBreakpointInstrumentor {
                                      final String desc,
                                      final String signature,
                                      final String[] exceptions) {
-      MethodVisitor superMethodVisitor = super.visitMethod(access, name, desc, signature, exceptions);
+      MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
 
       boolean isBridgeMethod = (access & Opcodes.ACC_BRIDGE) != 0;
 
       if (!isBridgeMethod && name != null && desc != null) {
         if (myClassesToTransform.contains(myClsName)) {
-          return new CaptureFieldsMethodVisitor(api, superMethodVisitor);
+          mv = new CaptureFieldsMethodVisitor(api, mv);
         }
 
         boolean isNonStaticMethod = (access & Opcodes.ACC_STATIC) == 0;
-        boolean isNonPrivateMethod = (access & Opcodes.ACC_PRIVATE) == 0;
         boolean isNonSynthetic = (access & Opcodes.ACC_SYNTHETIC) == 0;
         boolean isConstructor = name.equals(CONSTRUCTOR_METHOD_NAME);
 
-        if (isNonStaticMethod && isNonPrivateMethod &&
-            isNonSynthetic && !isConstructor &&
+        if (isNonStaticMethod && isNonSynthetic && !isConstructor &&
             myCollectionsToTransform.containsKey(myClsName)) {
-          return getCollectionMethodVisitor(access, name, desc, signature, exceptions, superMethodVisitor);
+          mv = getCollectionMethodVisitor(access, name, desc, signature, exceptions, mv);
+        }
+
+        String nestHost = myNestedCollectionMembers.get(myClsName);
+        if (nestHost != null) {
+          mv = new CollectionNestedClsMethodVisitor(api, access, name, desc, signature, exceptions, mv, nestHost);
         }
       }
 
-      return superMethodVisitor;
+      return mv;
     }
 
     private MethodVisitor getCollectionMethodVisitor(final int access,
@@ -589,8 +667,7 @@ public class CollectionBreakpointInstrumentor {
         return ((ReplacableMethod)method).getMethodVisitor(api, superMethodVisitor);
       }
 
-      CollectionMethodVisitor mv = new CollectionMethodVisitor(api, access, name, desc, superMethodVisitor, method);
-      return new TryCatchAdapter(api, access, name, desc, signature, exceptions, mv);
+      return new CollectionMethodVisitor(api, access, name, desc, signature, exceptions, superMethodVisitor, method);
     }
 
     private boolean shouldOptimizeCapture(String methodFullDesc) {
@@ -611,27 +688,13 @@ public class CollectionBreakpointInstrumentor {
              opcode == Opcodes.DRETURN || opcode == Opcodes.FRETURN;
     }
 
-    private class TryCatchAdapter extends MethodNode {
-      private final String myMethodFullDesc;
-
-      private TryCatchAdapter(int api, int access, String name, String desc, String signature, String[] exceptions, MethodVisitor mv) {
-        super(api, access, name, desc, signature, exceptions);
-        this.mv = mv;
-        myMethodFullDesc = name + desc;
-      }
-
-      @Override
-      public void visitEnd() {
-        super.visitEnd();
-        addTryCatchCode();
-        accept(mv);
-      }
-
-      private void addTryCatchCode() {
+    private abstract static class TryCatchProvider {
+      public void wrapMethodInTryCatch(MethodNode methodNode) {
         LabelNode startTryCatch = new LabelNode();
         LabelNode endTryCatch = new LabelNode();
         LabelNode handlerTryCatch = new LabelNode();
 
+        InsnList instructions = methodNode.instructions;
         AbstractInsnNode firstIns = instructions.getFirst();
         if (firstIns != null) {
           instructions.insertBefore(firstIns, startTryCatch);
@@ -643,24 +706,54 @@ public class CollectionBreakpointInstrumentor {
         InsnList additionalInstructions = new InsnList();
         additionalInstructions.add(endTryCatch);
         additionalInstructions.add(handlerTryCatch);
-        addEndCaptureInstructions(additionalInstructions);
+        addHandlerInstructions(additionalInstructions);
         additionalInstructions.add(new InsnNode(Opcodes.ATHROW));
 
         instructions.add(additionalInstructions);
 
         TryCatchBlockNode tryCatchBlockNode = new TryCatchBlockNode(startTryCatch, endTryCatch, handlerTryCatch, null);
-        tryCatchBlocks.add(tryCatchBlockNode);
+        methodNode.tryCatchBlocks.add(tryCatchBlockNode);
       }
 
-      private void addEndCaptureInstructions(InsnList insnList) {
-        insnList.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        insnList.add(new LdcInsnNode(shouldSynchronize(myMethodFullDesc)));
-        insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                                        getInstrumentorClassName(),
-                                        ON_CAPTURE_END_METHOD_NAME,
-                                        ON_CAPTURE_END_METHOD_DESC,
-                                        false));
-        maxStack += 1;
+      protected abstract void addHandlerInstructions(InsnList insnList);
+    }
+
+    private class TryCatchAdapter extends MethodNode {
+      private final String myMethodFullDesc;
+      private final TryCatchProvider myTryCatchProvider = new MyTryCatchProvider();
+
+      private TryCatchAdapter(int api,
+                              int access,
+                              String name,
+                              String desc,
+                              String signature,
+                              String[] exceptions,
+                              MethodVisitor mv) {
+        super(api, access, name, desc, signature, exceptions);
+        this.mv = mv;
+        myMethodFullDesc = name + desc;
+      }
+
+      @Override
+      public void visitEnd() {
+        super.visitEnd();
+        myTryCatchProvider.wrapMethodInTryCatch(this);
+        accept(mv);
+      }
+
+      private class MyTryCatchProvider extends TryCatchProvider {
+
+        @Override
+        protected void addHandlerInstructions(InsnList insnList) {
+          insnList.add(new VarInsnNode(Opcodes.ALOAD, 0));
+          insnList.add(new LdcInsnNode(shouldSynchronize(myMethodFullDesc)));
+          insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                          getInstrumentorClassName(),
+                                          ON_CAPTURE_END_METHOD_NAME,
+                                          ON_CAPTURE_END_DEFAULT_METHOD_DESC,
+                                          false));
+          maxStack += 1;
+        }
       }
     }
 
@@ -675,11 +768,13 @@ public class CollectionBreakpointInstrumentor {
       protected CollectionMethodVisitor(int api,
                                         int access,
                                         String name,
-                                        String descriptor,
-                                        MethodVisitor methodVisitor,
+                                        String desc,
+                                        String signature,
+                                        String[] exceptions,
+                                        MethodVisitor mv,
                                         KnownMethod delegate) {
-        super(api, access, descriptor, methodVisitor);
-        myMethodFullDesc = name + descriptor;
+        super(api, access, desc, new TryCatchAdapter(api, access, name, desc, signature, exceptions, mv));
+        myMethodFullDesc = name + desc;
         myDelegate = delegate;
       }
 
@@ -713,7 +808,7 @@ public class CollectionBreakpointInstrumentor {
         mv.visitMethodInsn(Opcodes.INVOKESTATIC,
                            getInstrumentorClassName(),
                            ON_CAPTURE_END_METHOD_NAME,
-                           ON_CAPTURE_END_METHOD_DESC,
+                           ON_CAPTURE_END_DEFAULT_METHOD_DESC,
                            false);
         myAdditionalStackSpace += 1;
       }
@@ -724,7 +819,7 @@ public class CollectionBreakpointInstrumentor {
         mv.visitMethodInsn(Opcodes.INVOKESTATIC,
                            getInstrumentorClassName(),
                            ON_CAPTURE_START_METHOD_NAME,
-                           ON_CAPTURE_START_METHOD_DESC,
+                           ON_CAPTURE_START_DEFAULT_METHOD_DESC,
                            false);
         myShouldCaptureVar = newLocal(Type.BOOLEAN_TYPE);
         mv.visitVarInsn(Opcodes.ISTORE, myShouldCaptureVar);
@@ -763,6 +858,135 @@ public class CollectionBreakpointInstrumentor {
         }
         else {
           myAdditionalStackSpace += ((OptimizedMethod)myDelegate).addCaptureModificationCode(mv, myShouldCaptureVar);
+        }
+      }
+    }
+
+    private static class CollectionNestedClsMethodVisitor extends MethodNode {
+      private int myAdditionalStackSpace = 0;
+      private final String myNestHost;
+
+      protected CollectionNestedClsMethodVisitor(int api,
+                                                 int access,
+                                                 String name,
+                                                 String desc,
+                                                 String signature,
+                                                 String[] exceptions,
+                                                 MethodVisitor mv,
+                                                 String nestHost) {
+        super(api, access, name, desc, signature, exceptions);
+        this.mv = mv;
+        myNestHost = nestHost;
+      }
+
+      private void addEndCaptureCode(InsnList insnList, int collectionCopiesVar, int numberOfCaptureStartCallsVar) {
+        insnList.add(new VarInsnNode(Opcodes.ALOAD, collectionCopiesVar));
+        insnList.add(new VarInsnNode(Opcodes.ALOAD, numberOfCaptureStartCallsVar));
+        insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                        getInstrumentorClassName(),
+                                        ON_CAPTURE_END_METHOD_NAME,
+                                        ON_CAPTURE_END_NESTED_CLS_METHOD_DESC,
+                                        false));
+        myAdditionalStackSpace += 2;
+      }
+
+      private void addLocalVariables(InsnList insnList, int collectionCopiesVar, int numberOfCaptureStartCallsVar) {
+        insnList.add(new InsnNode(Opcodes.DUP));
+        insnList.add(new VarInsnNode(Opcodes.ALOAD, collectionCopiesVar));
+        insnList.add(new VarInsnNode(Opcodes.ALOAD, numberOfCaptureStartCallsVar));
+        insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                        getInstrumentorClassName(),
+                                        ON_CAPTURE_START_METHOD_NAME,
+                                        ON_CAPTURE_START_NESTED_CLS_METHOD_DESC,
+                                        false));
+        myAdditionalStackSpace += 3;
+      }
+
+      private void addLocalVariables(int collectionCopiesVar, int numberOfCaptureStartCallsVar) {
+        InsnList list = new InsnList();
+        list.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                    getInstrumentorClassName(),
+                                    GET_COPIES_OF_COLLECTION_MAP_METHOD_NAME,
+                                    GET_COPIES_OF_COLLECTION_MAP_METHOD_DESC,
+                                    false));
+        list.add(new VarInsnNode(Opcodes.ASTORE, collectionCopiesVar));
+        list.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                    getInstrumentorClassName(),
+                                    GET_NUMBER_OF_START_CAPTURE_METHOD_NAME,
+                                    GET_NUMBER_OF_START_CAPTURE_METHOD_DESC,
+                                    false));
+        list.add(new VarInsnNode(Opcodes.ASTORE, numberOfCaptureStartCallsVar));
+        instructions.insertBefore(instructions.getFirst(), list);
+        myAdditionalStackSpace += 1;
+      }
+
+      private boolean containsNestHostFieldIns() {
+        for (AbstractInsnNode node : instructions) {
+          if (node instanceof FieldInsnNode && node.getOpcode() == Opcodes.GETFIELD) {
+            Type fieldType = Type.getType(((FieldInsnNode)node).desc);
+            if (myNestHost.equals(fieldType.getInternalName())) {
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      private void addCaptureModificationsCode(int collectionCopiesVar, int numberOfCaptureStartCallsVar) {
+        for (AbstractInsnNode node : instructions) {
+          int opcode = node.getOpcode();
+          if (node instanceof FieldInsnNode && opcode == Opcodes.GETFIELD) {
+            Type fieldType = Type.getType(((FieldInsnNode)node).desc);
+            if (myNestHost.equals(fieldType.getInternalName())) {
+              InsnList insnList = new InsnList();
+              addLocalVariables(insnList, collectionCopiesVar, numberOfCaptureStartCallsVar);
+              instructions.insert(node, insnList);
+            }
+          }
+          else if (isReturnInstruction(opcode)) {
+            InsnList insnList = new InsnList();
+            addEndCaptureCode(insnList, collectionCopiesVar, numberOfCaptureStartCallsVar);
+            instructions.insertBefore(node, insnList);
+          }
+        }
+      }
+
+      private void addCaptureModificationsCode() {
+        int collectionCopiesVar = maxLocals;
+        int numberOfCaptureStartCallsVar = maxLocals + 1;
+
+        MyTryCatchProvider tryCatchProvider = new MyTryCatchProvider(collectionCopiesVar, numberOfCaptureStartCallsVar);
+        tryCatchProvider.wrapMethodInTryCatch(this);
+
+        addLocalVariables(collectionCopiesVar, numberOfCaptureStartCallsVar);
+
+        addCaptureModificationsCode(collectionCopiesVar, numberOfCaptureStartCallsVar);
+
+        maxStack += myAdditionalStackSpace;
+        maxLocals += 2;
+      }
+
+      @Override
+      public void visitEnd() {
+        super.visitEnd();
+        if (containsNestHostFieldIns()) {
+          addCaptureModificationsCode();
+        }
+        accept(mv);
+      }
+
+      private class MyTryCatchProvider extends TryCatchProvider {
+        private final int myCollectionCopiesVar;
+        private final int myNumberOfCaptureStartCallsVar;
+
+        private MyTryCatchProvider(int collectionCopiesVar, int numberOfCaptureStartCallsVar) {
+          this.myCollectionCopiesVar = collectionCopiesVar;
+          this.myNumberOfCaptureStartCallsVar = numberOfCaptureStartCallsVar;
+        }
+
+        @Override
+        protected void addHandlerInstructions(InsnList insnList) {
+          addEndCaptureCode(insnList, myCollectionCopiesVar, myNumberOfCaptureStartCallsVar);
         }
       }
     }
@@ -938,14 +1162,22 @@ public class CollectionBreakpointInstrumentor {
           e.printStackTrace();
         }
       }
-      int result = myMethodEnterNumber.get();
-      myMethodEnterNumber.set(result + 1);
-      return result == 0;
+      int methodEnterNumber = getMethodEnterNumber();
+      setMethodEnterNumber(methodEnterNumber + 1);
+      return methodEnterNumber == 0;
+    }
+
+    public Integer getMethodEnterNumber() {
+      return myMethodEnterNumber.get();
+    }
+
+    public void setMethodEnterNumber(Integer number) {
+      myMethodEnterNumber.set(number);
     }
 
     public void unlock(boolean shouldSynchronized) {
       try {
-        myMethodEnterNumber.set(myMethodEnterNumber.get() - 1);
+        setMethodEnterNumber(getMethodEnterNumber() - 1);
         if (shouldSynchronized) {
           myLock.unlock();
         }
