@@ -615,18 +615,27 @@ public class CollectionBreakpointInstrumentor {
         }
 
         boolean isStaticMethod = (access & Opcodes.ACC_STATIC) != 0;
-        boolean isNonSynthetic = (access & Opcodes.ACC_SYNTHETIC) == 0;
         boolean isConstructor = name.equals(CONSTRUCTOR_METHOD_NAME);
 
-        if (!isStaticMethod && isNonSynthetic && !isConstructor &&
-            myCollectionsToTransform.containsKey(myClsName)) {
+        if (!isStaticMethod && !isConstructor && myCollectionsToTransform.containsKey(myClsName)) {
           mv = getCollectionMethodVisitor(access, name, desc, signature, exceptions, mv);
         }
 
+        Set<String> fieldOwnerTypes = new HashSet<String>();
         String nestHost = myNestedCollectionMembers.get(myClsName);
         if (nestHost != null) {
-          mv = new CollectionNestedClsMethodVisitor(api, access, name, desc, signature, exceptions, mv, nestHost);
+          fieldOwnerTypes.add(nestHost);
         }
+
+        if (isStaticMethod && myCollectionsToTransform.containsKey(myClsName)) {
+          fieldOwnerTypes.add(myClsName);
+        }
+
+        if (!fieldOwnerTypes.isEmpty()) {
+          mv = new FieldOperationsTracker(api, access, name, desc, signature, exceptions, mv, fieldOwnerTypes);
+        }
+
+        return mv;
       }
 
       return mv;
@@ -651,7 +660,7 @@ public class CollectionBreakpointInstrumentor {
         return ((ReplacableMethod)method).getMethodVisitor(api, superMethodVisitor);
       }
 
-      return new CollectionMethodVisitor(api, access, name, desc, signature, exceptions, superMethodVisitor, method);
+      return new DefaultCollectionMethodVisitor(api, access, name, desc, signature, exceptions, superMethodVisitor, method);
     }
 
     private boolean shouldOptimizeCapture(String methodFullDesc) {
@@ -750,7 +759,7 @@ public class CollectionBreakpointInstrumentor {
       }
     }
 
-    private class CollectionMethodVisitor extends LocalVariablesSorter {
+    private class DefaultCollectionMethodVisitor extends LocalVariablesSorter {
       private final String myMethodFullDesc;
       private final KnownMethod myDelegate;
       private int myCollectionCopyVar;
@@ -758,14 +767,14 @@ public class CollectionBreakpointInstrumentor {
       private int myAdditionalStackSpace = 0;
       private int myNumberOfAdditionalLocalVars = 0;
 
-      protected CollectionMethodVisitor(int api,
-                                        int access,
-                                        String name,
-                                        String desc,
-                                        String signature,
-                                        String[] exceptions,
-                                        MethodVisitor mv,
-                                        KnownMethod delegate) {
+      protected DefaultCollectionMethodVisitor(int api,
+                                               int access,
+                                               String name,
+                                               String desc,
+                                               String signature,
+                                               String[] exceptions,
+                                               MethodVisitor mv,
+                                               KnownMethod delegate) {
         super(api, access, desc, new TryCatchAdapter(api, access, name, desc, signature, exceptions, mv));
         myMethodFullDesc = name + desc;
         myDelegate = delegate;
@@ -855,21 +864,21 @@ public class CollectionBreakpointInstrumentor {
       }
     }
 
-    private static class CollectionNestedClsMethodVisitor extends MethodNode {
+    private static class FieldOperationsTracker extends MethodNode {
       private int myAdditionalStackSpace = 0;
-      private final String myNestHost;
+      private final Set<String> myFieldOwnerTypes;
 
-      protected CollectionNestedClsMethodVisitor(int api,
-                                                 int access,
-                                                 String name,
-                                                 String desc,
-                                                 String signature,
-                                                 String[] exceptions,
-                                                 MethodVisitor mv,
-                                                 String nestHost) {
+      protected FieldOperationsTracker(int api,
+                                       int access,
+                                       String name,
+                                       String desc,
+                                       String signature,
+                                       String[] exceptions,
+                                       MethodVisitor mv,
+                                       Set<String> fieldOwnerTypes) {
         super(api, access, name, desc, signature, exceptions);
         this.mv = mv;
-        myNestHost = nestHost;
+        myFieldOwnerTypes = fieldOwnerTypes;
       }
 
       private void addEndCaptureCode(InsnList insnList, int collectionCopiesVar) {
@@ -882,15 +891,30 @@ public class CollectionBreakpointInstrumentor {
         myAdditionalStackSpace += 2;
       }
 
-      private void addStartCaptureCode(InsnList insnList, int collectionCopiesVar) {
-        insnList.add(new InsnNode(Opcodes.DUP));
+      private void putCollectionInstanceOnStack(int fieldInsCode, InsnList insnList) {
+        if (fieldInsCode == Opcodes.PUTFIELD) {
+          insnList.add(new InsnNode(Opcodes.DUP2));
+          insnList.add(new InsnNode(Opcodes.POP));
+          myAdditionalStackSpace += 2;
+        }
+        else if (fieldInsCode == Opcodes.GETFIELD) {
+          insnList.add(new InsnNode(Opcodes.DUP));
+          myAdditionalStackSpace += 1;
+        }
+      }
+
+      private void addStartCaptureCode(int fieldInsCode, InsnList insnList, int collectionCopiesVar) {
+        if (fieldInsCode != Opcodes.PUTFIELD && fieldInsCode != Opcodes.GETFIELD) {
+          return;
+        }
+        putCollectionInstanceOnStack(fieldInsCode, insnList);
         insnList.add(new VarInsnNode(Opcodes.ALOAD, collectionCopiesVar));
         insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                                         getInstrumentorClassName(),
                                         ON_CAPTURE_START_METHOD_NAME,
                                         ON_CAPTURE_START_NESTED_CLS_METHOD_DESC,
                                         false));
-        myAdditionalStackSpace += 3;
+        myAdditionalStackSpace += 2;
       }
 
       private void addLocalVariables(AbstractInsnNode insertAfterThis, int collectionCopiesVar) {
@@ -922,20 +946,29 @@ public class CollectionBreakpointInstrumentor {
         }
       }
 
-      private boolean containsNestHostFieldIns() {
+      private boolean containsFieldIns() {
         for (AbstractInsnNode node : instructions) {
-          if (node instanceof FieldInsnNode) {
-            boolean isGetOrPutOp = node.getOpcode() == Opcodes.GETFIELD || node.getOpcode() == Opcodes.PUTFIELD;
-            if (!isGetOrPutOp) {
-              continue;
-            }
+          if (node instanceof FieldInsnNode &&
+              (node.getOpcode() == Opcodes.GETFIELD || node.getOpcode() == Opcodes.PUTFIELD)) {
             String fieldOwnerType = ((FieldInsnNode)node).owner;
-            if (myNestHost.equals(fieldOwnerType)) {
+            if (myFieldOwnerTypes.contains(fieldOwnerType)) {
               return true;
             }
           }
         }
         return false;
+      }
+
+      private void processReturnIns(AbstractInsnNode insNode, int collectionCopiesVar) {
+        InsnList insnList = new InsnList();
+        addEndCaptureCode(insnList, collectionCopiesVar);
+        instructions.insertBefore(insNode, insnList);
+      }
+
+      private void processFieldIns(int fieldInsCode, AbstractInsnNode insNode, int collectionCopiesVar) {
+        InsnList insnList = new InsnList();
+        addStartCaptureCode(fieldInsCode, insnList, collectionCopiesVar);
+        instructions.insertBefore(insNode, insnList);
       }
 
       private void addCaptureModificationsCode(AbstractInsnNode insertAfterThis, int collectionCopiesVar) {
@@ -945,23 +978,17 @@ public class CollectionBreakpointInstrumentor {
             shouldInsert = insNode == insertAfterThis;
             continue;
           }
+
           int opcode = insNode.getOpcode();
-          if (insNode instanceof FieldInsnNode) {
-            boolean isGetOrPutOp = opcode == Opcodes.GETFIELD || opcode == Opcodes.PUTFIELD;
-            if (!isGetOrPutOp) {
-              continue;
-            }
+          if (insNode instanceof FieldInsnNode &&
+              (opcode == Opcodes.GETFIELD || opcode == Opcodes.PUTFIELD)) {
             String fieldOwnerType = ((FieldInsnNode)insNode).owner;
-            if (myNestHost.equals(fieldOwnerType)) {
-              InsnList insnList = new InsnList();
-              addStartCaptureCode(insnList, collectionCopiesVar);
-              instructions.insertBefore(insNode, insnList);
+            if (myFieldOwnerTypes.contains(fieldOwnerType)) {
+              processFieldIns(opcode, insNode, collectionCopiesVar);
             }
           }
           else if (isReturnInstruction(opcode)) {
-            InsnList insnList = new InsnList();
-            addEndCaptureCode(insnList, collectionCopiesVar);
-            instructions.insertBefore(insNode, insnList);
+            processReturnIns(insNode, collectionCopiesVar);
           }
         }
       }
@@ -996,7 +1023,7 @@ public class CollectionBreakpointInstrumentor {
       @Override
       public void visitEnd() {
         super.visitEnd();
-        if (containsNestHostFieldIns()) {
+        if (containsFieldIns()) {
           addCaptureModificationsCode();
         }
         accept(mv);
