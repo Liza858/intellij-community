@@ -175,15 +175,15 @@ public class CollectionBreakpointInstrumentor {
 
   @SuppressWarnings("unused")
   public static void captureCollectionModification(Multiset oldElements,
-                                                   Object newCollectionInstance) {
+                                                   Object collectionInstance) {
     try {
-      CollectionInstanceLock lock = myInstanceFilters.get(newCollectionInstance);
+      CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
       if (oldElements == null || lock == null) {
         return;
       }
-      ArrayList<Modification> modifications = getModifications(oldElements, newCollectionInstance);
+      ArrayList<Modification> modifications = getModifications(oldElements, collectionInstance);
       if (!modifications.isEmpty()) {
-        saveCollectionModifications(newCollectionInstance, modifications);
+        saveCollectionModifications(collectionInstance, modifications);
       }
     }
     catch (Exception e) {
@@ -242,12 +242,15 @@ public class CollectionBreakpointInstrumentor {
     try {
       for (Map.Entry<Object, Multiset> entry : copiesOfCollections.entrySet()) {
         Object collectionInstance = entry.getKey();
+        Multiset oldElements = entry.getValue();
         CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
-        if (lock == null) {
+        if (lock == null || oldElements == null) {
           continue;
         }
-        Multiset oldCollectionElements = entry.getValue();
-        captureCollectionModification(oldCollectionElements, collectionInstance);
+        ArrayList<Modification> modifications = getModifications(oldElements, collectionInstance);
+        if (!modifications.isEmpty()) {
+          saveCollectionModifications(collectionInstance, modifications);
+        }
         lock.unlock(true);
       }
     }
@@ -519,7 +522,7 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  private static String getInstrumentorClassName() {
+  public static String getInstrumentorClassName() {
     return getInternalClsName(CollectionBreakpointInstrumentor.class);
   }
 

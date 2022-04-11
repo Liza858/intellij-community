@@ -19,6 +19,7 @@ public class CollectionBreakpointStorage {
   private static final ConcurrentMap<CapturedField, FieldHistory> FIELD_MODIFICATIONS_STORAGE;
   private static final ConcurrentMap<CollectionWrapper, CollectionHistory> COLLECTION_MODIFICATIONS_STORAGE;
   private static final Object[] EMPTY_OBJECT_ARRAY = new Object[0];
+  private static final String INSTRUMENTOR_PACKAGE = "com.intellij.rt.debugger.agent";
 
   private static boolean ENABLED; // set from debugger
 
@@ -189,11 +190,14 @@ public class CollectionBreakpointStorage {
 
     public List<StackTraceElement> getStackTrace() {
       StackTraceElement[] stackTrace = myException.getStackTrace();
-      int startIndex = this instanceof CollectionModificationInfo ? 3 : 2;
-      if (startIndex > stackTrace.length - 1) {
-        return Collections.emptyList();
+      int index;
+      for (index = 0; index < stackTrace.length; index++) {
+        String clsName = stackTrace[index].getClassName();
+        if (!clsName.startsWith(INSTRUMENTOR_PACKAGE)) {
+          break;
+        }
       }
-      return Arrays.asList(stackTrace).subList(startIndex, stackTrace.length);
+      return Arrays.asList(stackTrace).subList(index, stackTrace.length);
     }
   }
 

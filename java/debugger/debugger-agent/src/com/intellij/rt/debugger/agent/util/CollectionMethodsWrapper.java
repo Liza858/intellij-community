@@ -21,7 +21,8 @@ public class CollectionMethodsWrapper {
                                                                        element,
                                                                        true);
       }
-    } finally {
+    }
+    finally {
       CollectionBreakpointInstrumentor.onCaptureEnd(collection, SHOULD_SYNCHRONIZED);
     }
     return addedSomething;
@@ -40,7 +41,8 @@ public class CollectionMethodsWrapper {
                                                                        element,
                                                                        false);
       }
-    } finally {
+    }
+    finally {
       CollectionBreakpointInstrumentor.onCaptureEnd(collection, SHOULD_SYNCHRONIZED);
     }
     return removedSomething;
