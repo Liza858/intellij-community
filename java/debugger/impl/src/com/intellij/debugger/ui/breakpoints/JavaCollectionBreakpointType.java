@@ -127,12 +127,8 @@ public class JavaCollectionBreakpointType extends JavaLineBreakpointTypeBase<Jav
     }
     return canPutAtElement(file, line, project, (element, document) -> {
       if (element instanceof PsiField) {
-        boolean isFinal = ((PsiField)element).hasModifierProperty(PsiModifier.FINAL);
-        boolean isPrivate = ((PsiField)element).hasModifierProperty(PsiModifier.PRIVATE);
-        boolean isProtected = ((PsiField)element).hasModifierProperty(PsiModifier.PROTECTED);
-        boolean hasValidModifiers = isFinal || isPrivate || isProtected;
         PsiType type = ((PsiField)element).getType();
-        return hasValidModifiers && CollectionUtils.isCollectionClassOrInterface(type);
+        return CollectionUtils.isCollectionClassOrInterface(type);
       }
       return false;
     });

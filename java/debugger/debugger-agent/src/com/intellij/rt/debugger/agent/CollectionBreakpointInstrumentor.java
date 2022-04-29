@@ -1204,10 +1204,6 @@ public class CollectionBreakpointInstrumentor {
     private final ReentrantLock myLock = new ReentrantLock();
     private final ThreadLocal<Integer> myMethodEnterNumber = new ThreadLocal<Integer>();
 
-    private CollectionInstanceLock() {
-      myMethodEnterNumber.set(0);
-    }
-
     public boolean lock(boolean shouldSynchronized) {
       if (shouldSynchronized) {
         try {
@@ -1217,13 +1213,18 @@ public class CollectionBreakpointInstrumentor {
           e.printStackTrace();
         }
       }
-      int methodEnterNumber = getMethodEnterNumber();
+      Integer methodEnterNumber = getMethodEnterNumber();
       setMethodEnterNumber(methodEnterNumber + 1);
       return methodEnterNumber == 0;
     }
 
     public Integer getMethodEnterNumber() {
-      return myMethodEnterNumber.get();
+      Integer methodEnterNumber = myMethodEnterNumber.get();
+      if (methodEnterNumber == null) {
+        setMethodEnterNumber(0);
+        return 0;
+      }
+      return methodEnterNumber;
     }
 
     public void setMethodEnterNumber(Integer number) {
