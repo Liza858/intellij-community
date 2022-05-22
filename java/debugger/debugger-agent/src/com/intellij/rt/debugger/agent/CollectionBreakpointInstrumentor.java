@@ -652,11 +652,11 @@ public class CollectionBreakpointInstrumentor {
         Set<String> fieldOwnerTypes = new HashSet<String>();
         String nestHost = myNestedCollectionMembers.get(myClsName);
         if (nestHost != null) {
-          fieldOwnerTypes.add(nestHost);
+          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet());
         }
 
         if (isStaticMethod && myCollectionsToTransform.containsKey(myClsName)) {
-          fieldOwnerTypes.add(myClsName);
+          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet());
         }
 
         if (!fieldOwnerTypes.isEmpty()) {
