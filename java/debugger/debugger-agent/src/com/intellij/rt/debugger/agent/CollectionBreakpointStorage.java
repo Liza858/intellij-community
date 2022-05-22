@@ -9,7 +9,6 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -201,23 +200,23 @@ public class CollectionBreakpointStorage {
     }
   }
 
-  private static class CollectionModificationInfo extends CapturedStackInfo {
+  public static class CollectionModificationInfo extends CapturedStackInfo {
     private final Object myElement;
     private final boolean myIsAddition;
 
-    private CollectionModificationInfo(Throwable exception, Object elem, boolean isAddition) {
+    public CollectionModificationInfo(Throwable exception, Object elem, boolean isAddition) {
       super(exception);
       myElement = elem;
       myIsAddition = isAddition;
     }
 
     @SuppressWarnings("unused")
-    private Object getElement() {
+    public Object getElement() {
       return myElement;
     }
 
     @SuppressWarnings("unused")
-    private boolean isAddition() {
+    public boolean isAddition() {
       return myIsAddition;
     }
   }

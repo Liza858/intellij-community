@@ -36,6 +36,8 @@ public final class CollectionBreakpointUtils {
   private static final String INSTRUMENTOR_CLS_NAME = "com.intellij.rt.debugger.agent.CollectionBreakpointInstrumentor";
   private static final String STORAGE_CLASS_NAME = "com.intellij.rt.debugger.agent.CollectionBreakpointStorage";
 
+  private static final String PAIR_CLS_NAME = INSTRUMENTOR_CLS_NAME + "$Pair";
+
   private static final String COLLECTION_MODIFICATION_INFO_CLASS_NAME = STORAGE_CLASS_NAME + "$" + "CollectionModificationInfo";
 
   private static final String ENABLE_DEBUG_MODE_FIELD = "DEBUG";
@@ -53,6 +55,10 @@ public final class CollectionBreakpointUtils {
   private static final String GET_ELEMENT_METHOD_DESC = "()" + OBJECT_TYPE;
   private static final String IS_ADDITION_METHOD_NAME = "isAddition";
   private static final String IS_ADDITION_METHOD_DESC = "()Z";
+  private static final String GET_KEY_METHOD_NAME = "getKey";
+  private static final String GET_KEY_METHOD_DESC = "()" + OBJECT_TYPE;
+  private static final String GET_VALUE_METHOD_NAME = "getValue";
+  private static final String GET_VALUE_METHOD_DESC = "()" + OBJECT_TYPE;
 
   public static void setupCollectionBreakpointAgent(DebugProcessImpl debugProcess) {
     if (Registry.is("debugger.collection.breakpoint.agent.debug")) {
@@ -78,10 +84,8 @@ public final class CollectionBreakpointUtils {
     }
   }
 
-  private static void setClassBooleanField(DebugProcessImpl debugProcess,
-                                           String clsName,
-                                           String fieldName,
-                                           boolean value) throws EvaluateException {
+  private static void setClassBooleanField(DebugProcessImpl debugProcess, String clsName, String fieldName, boolean value)
+    throws EvaluateException {
     final RequestManagerImpl requestsManager = debugProcess.getRequestsManager();
     ClassPrepareRequestor requestor = new ClassPrepareRequestor() {
       @Override
@@ -125,10 +129,9 @@ public final class CollectionBreakpointUtils {
     Value clsNameRef = virtualMachineProxy.mirrorOf(clsName);
     Value fieldNameRef = virtualMachineProxy.mirrorOf(fieldName);
 
-    Value result = invokeStorageMethod(context.getDebugProcess(), context,
-                                       GET_FIELD_MODIFICATIONS_METHOD_NAME,
-                                       GET_FIELD_MODIFICATIONS_METHOD_DESC,
-                                       toList(clsNameRef, fieldNameRef, clsInstance));
+    Value result =
+      invokeStorageMethod(context.getDebugProcess(), context, GET_FIELD_MODIFICATIONS_METHOD_NAME, GET_FIELD_MODIFICATIONS_METHOD_DESC,
+                          toList(clsNameRef, fieldNameRef, clsInstance));
 
     if (result instanceof ArrayReference) {
       return ((ArrayReference)result).getValues();
@@ -152,9 +155,7 @@ public final class CollectionBreakpointUtils {
     Value clsNameRef = virtualMachineProxy.mirrorOf(clsName);
     Value fieldNameRef = virtualMachineProxy.mirrorOf(fieldName);
 
-    Value result = invokeStorageMethod(context.getDebugProcess(), context,
-                                       GET_FIELD_STACK_METHOD_NAME,
-                                       GET_FIELD_STACK_METHOD_DESC,
+    Value result = invokeStorageMethod(context.getDebugProcess(), context, GET_FIELD_STACK_METHOD_NAME, GET_FIELD_STACK_METHOD_DESC,
                                        toList(clsNameRef, fieldNameRef, collectionInstance, modificationIndex));
 
     String message = result instanceof StringReference ? ((StringReference)result).value() : "";
@@ -212,8 +213,7 @@ public final class CollectionBreakpointUtils {
       return Collections.emptyList();
     }
 
-    Value collectionModifications = invokeStorageMethod(context.getDebugProcess(), context,
-                                                        GET_COLLECTION_MODIFICATIONS_METHOD_NAME,
+    Value collectionModifications = invokeStorageMethod(context.getDebugProcess(), context, GET_COLLECTION_MODIFICATIONS_METHOD_NAME,
                                                         GET_COLLECTION_MODIFICATIONS_METHOD_DESC,
                                                         Collections.singletonList(collectionInstance));
 
@@ -233,10 +233,9 @@ public final class CollectionBreakpointUtils {
       return Collections.emptyList();
     }
 
-    Value result = invokeStorageMethod(context.getDebugProcess(), context,
-                                       GET_COLLECTION_STACK_METHOD_NAME,
-                                       GET_COLLECTION_STACK_METHOD_DESC,
-                                       toList(collectionInstance, modificationIndex));
+    Value result =
+      invokeStorageMethod(context.getDebugProcess(), context, GET_COLLECTION_STACK_METHOD_NAME, GET_COLLECTION_STACK_METHOD_DESC,
+                          toList(collectionInstance, modificationIndex));
 
     String message = result instanceof StringReference ? ((StringReference)result).value() : "";
 
@@ -268,6 +267,32 @@ public final class CollectionBreakpointUtils {
           debugProcess.invokeInstanceMethod(evaluationContext, collectionInstance, isAdditionMethod, Collections.emptyList(), 0);
         if (element instanceof ObjectReference && isAddition instanceof BooleanValue) {
           return new Pair<>((ObjectReference)element, (BooleanValue)isAddition);
+        }
+      }
+      catch (EvaluateException e) {
+        DebuggerUtilsImpl.logError(e);
+      }
+    }
+    return null;
+  }
+
+  @Nullable
+  public static Pair<Value, Value> getKeyAndValue(DebugProcessImpl debugProcess,
+                                                  EvaluationContext evaluationContext,
+                                                  ObjectReference mapEntryRef) {
+    DebuggerManagerThreadImpl.assertIsManagerThread();
+    ClassType cls = getClass(debugProcess, evaluationContext, PAIR_CLS_NAME);
+    if (cls != null) {
+      Method getKeyMethod = DebuggerUtils.findMethod(cls, GET_KEY_METHOD_NAME, GET_KEY_METHOD_DESC);
+      Method getValueMethod = DebuggerUtils.findMethod(cls, GET_VALUE_METHOD_NAME, GET_VALUE_METHOD_DESC);
+      if (getKeyMethod == null || getValueMethod == null) {
+        return null;
+      }
+      try {
+        Value key = debugProcess.invokeInstanceMethod(evaluationContext, mapEntryRef, getKeyMethod, Collections.emptyList(), 0);
+        Value value = debugProcess.invokeInstanceMethod(evaluationContext, mapEntryRef, getValueMethod, Collections.emptyList(), 0);
+        if (key != null && value != null) {
+          return new Pair<>(key, value);
         }
       }
       catch (EvaluateException e) {

@@ -1,10 +1,14 @@
 // Copyright 2000-2022 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
 package com.intellij.debugger.memory.ui
 
-import com.intellij.debugger.engine.*
+import com.intellij.debugger.engine.CollectionBreakpointUtils
+import com.intellij.debugger.engine.DebuggerManagerThreadImpl
+import com.intellij.debugger.engine.JavaDebugProcess
+import com.intellij.debugger.engine.JavaValue
 import com.intellij.debugger.engine.evaluation.EvaluationContext
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl
 import com.intellij.debugger.engine.events.DebuggerCommandImpl
+import com.intellij.debugger.impl.DebuggerUtilsImpl
 import com.intellij.debugger.impl.DebuggerUtilsImpl.getValueMarkers
 import com.intellij.debugger.jdi.VirtualMachineProxyImpl
 import com.intellij.debugger.memory.utils.InstanceJavaValue
@@ -23,8 +27,7 @@ import com.intellij.debugger.ui.tree.render.NodeRenderer
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
-import com.intellij.psi.CommonClassNames
-import com.intellij.psi.PsiType
+import com.intellij.psi.*
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.util.InheritanceUtil
 import com.intellij.psi.util.PsiUtil
@@ -35,7 +38,6 @@ import com.intellij.xdebugger.frame.XValueChildrenList
 import com.intellij.xdebugger.impl.ui.tree.nodes.XValueNodeImpl
 import com.intellij.xdebugger.memory.ui.InstancesTree
 import com.sun.jdi.BooleanValue
-import com.sun.jdi.ClassType
 import com.sun.jdi.ObjectReference
 import com.sun.jdi.Value
 import org.jetbrains.annotations.ApiStatus
@@ -49,7 +51,7 @@ class CollectionHistoryView(private val myClsName: String,
                             debugProcess: XDebugProcess,
                             private val myValueNode: XValueNodeImpl?) {
   private val DEFAULT_SPLITTER_PROPORTION = 0.5f
-  private val MAX_INSTANCES_NUMBER: Long = 1000000
+  private val MAX_INSTANCES_NUMBER: Long = 0
 
   private val myDebugProcess = (debugProcess as JavaDebugProcess).debuggerSession.process
   private val myDebugSession = debugProcess.session
@@ -61,6 +63,7 @@ class CollectionHistoryView(private val myClsName: String,
                                                                     getValueMarkers(myDebugProcess)) { }
   private val myHistoryTree: InstancesTree = InstancesTree(myDebugProcess.project, myDebugSession.debugProcess.editorsProvider,
                                                            getValueMarkers(myDebugProcess)) { }
+  private val myFieldIsStatic = findPsiField()?.hasModifierProperty(PsiModifier.STATIC) ?: true
   private val myMainComponent: JComponent
 
   init {
@@ -70,7 +73,11 @@ class CollectionHistoryView(private val myClsName: String,
     mySplitter.firstComponent = JBScrollPane(myHistoryTree)
     mySplitter.secondComponent = JBScrollPane(myStackFrameList)
 
-    if (myValueNode == null) {
+    if (myFieldIsStatic) {
+      loadStaticFieldHistory()
+      myMainComponent = mySplitter
+    }
+    else if (myValueNode == null) {
       setupInstancesTree()
       val splitter = JBSplitter(false, 0.3F)
       splitter.setHonorComponentsMinimumSize(false)
@@ -84,6 +91,13 @@ class CollectionHistoryView(private val myClsName: String,
     }
   }
 
+  private fun findPsiField(): PsiField? {
+    return JavaPsiFacade
+      .getInstance(myDebugSession.project)
+      .findClass(myClsName, GlobalSearchScope.allScope(myDebugSession.project))
+      ?.findFieldByName(myFieldName, false)
+  }
+
   private fun setupInstancesTree() {
     myHistoryInstancesTree.addTreeSelectionListener(TreeSelectionListener {
       myHistoryTree.addChildren(createChildren(listOf(), null), true)
@@ -91,15 +105,23 @@ class CollectionHistoryView(private val myClsName: String,
       invokeInDebuggerThread {
         val selectionPath = it.path
         val node = selectionPath?.lastPathComponent as? XValueNodeImpl ?: return@invokeInDebuggerThread
-        val clsType = (node.valueContainer as? JavaValue)?.descriptor?.type?.name() ?: return@invokeInDebuggerThread
-        loadFieldHistory(clsType, myFieldName, node)
+        val clsName = getClsName() ?: return@invokeInDebuggerThread
+        loadFieldHistory(clsName, myFieldName, node)
       }
     })
 
     myHistoryInstancesTree.addChildren(createChildren(listOf(), null), true)
     invokeInDebuggerThread {
       val virtualMachineProxy = getVirtualMachine() ?: return@invokeInDebuggerThread
-      val classes = virtualMachineProxy.allClasses().filter { it.name().replace("$", ".") == myClsName }
+      val baseClasses = virtualMachineProxy.allClasses().filter { it.name().replace("$", ".") == myClsName }
+      val classes = virtualMachineProxy.allClasses().filter { cls ->
+        for (baseCls in baseClasses) {
+          if (DebuggerUtilsImpl.instanceOf(cls, baseCls)) {
+            return@filter true
+          }
+        }
+        return@filter false
+      }
       val instances = classes.flatMap { it.instances(MAX_INSTANCES_NUMBER) }
       invokeLater { myHistoryInstancesTree.addChildren(createChildren(instances, null), true) }
     }
@@ -118,16 +140,11 @@ class CollectionHistoryView(private val myClsName: String,
       invokeInDebuggerThread {
         val virtualMachineProxy = getVirtualMachine() ?: return@invokeInDebuggerThread
         val items = if (parentNode == myHistoryTree.root) {
-          val descriptor = (myValueNode?.valueContainer as? JavaValue)?.descriptor as? FieldDescriptor
-          var clsName = descriptor?.field?.declaringType()?.name()
-          if (clsName == null) {
-            clsName = (getSelectedNode(myHistoryInstancesTree)?.valueContainer as? JavaValue)?.descriptor?.type?.name()
-          }
+          var clsName = getClsName()
 
           val parent = myValueNode?.parent ?: getSelectedNode(myHistoryInstancesTree)
-          val field = getObjectReferenceForNode(parent as? XValueNodeImpl)?.referenceType()?.fieldByName(myFieldName)
-                      ?: return@invokeInDebuggerThread
-          val clsInstance = if (!field.isStatic) getObjectReferenceForNode(parent as? XValueNodeImpl) else null
+
+          val clsInstance = if (!myFieldIsStatic) getObjectReferenceForNode(parent as? XValueNodeImpl) else null
           val modificationIndex = virtualMachineProxy.mirrorOf(parentRow!!)
           CollectionBreakpointUtils.getFieldModificationStack(mySuspendContext, myFieldName, clsName, clsInstance, modificationIndex)
         }
@@ -163,6 +180,28 @@ class CollectionHistoryView(private val myClsName: String,
         loadFieldHistory(field.declaringType().name(), field.name(), parent)
       }
     }
+  }
+
+  private fun loadStaticFieldHistory() {
+    invokeInDebuggerThread {
+      val clsName = getClsName() ?: return@invokeInDebuggerThread
+
+      val fieldModifications = CollectionBreakpointUtils.getFieldModificationsHistory(mySuspendContext, myFieldName, clsName, null)
+
+      invokeLater { myHistoryTree.addChildren(createChildren(fieldModifications, CollectionHistoryRenderer()), true) }
+    }
+  }
+
+  private fun getClsName(): String? {
+    val virtualMachineProxy = getVirtualMachine() ?: return null
+    val classesNames = virtualMachineProxy
+      .allClasses()
+      .map { it.name() }
+      .filter { name -> name.replace("$", ".") == myClsName }
+
+    if (classesNames.size != 1) return null
+
+    return classesNames[0]
   }
 
   private fun createChildren(values: List<Value>, renderer: NodeRenderer?): XValueChildrenList {
@@ -270,12 +309,9 @@ class CollectionHistoryView(private val myClsName: String,
       }
 
       private fun evaluate(evaluationContext: EvaluationContext): Pair<Value, Value>? {
-        val cls = myDebugProcess.findClass(evaluationContext, "com.intellij.rt.debugger.agent.CollectionBreakpointInstrumentor\$Pair",
-                                           null) as? ClassType ?: return null
-        val getKey = DebuggerUtils.findMethod(cls, "getKey", "()Ljava/lang/Object;") ?: return null
-        val getValue = DebuggerUtils.findMethod(cls, "getValue", "()Ljava/lang/Object;") ?: return null
-        val key = myDebugProcess.invokeInstanceMethod(evaluationContext, obj!!, getKey, listOf(), 0)
-        val value = myDebugProcess.invokeInstanceMethod(evaluationContext, obj, getValue, listOf(), 0)
+        val pair = CollectionBreakpointUtils.getKeyAndValue(myDebugProcess, evaluationContext, obj)
+        val key = pair?.first ?: return null
+        val value = pair.second ?: return null
         return Pair(key, value)
       }
 
@@ -286,20 +322,6 @@ class CollectionHistoryView(private val myClsName: String,
         val psiType = PsiType.getTypeByName(type.name(), project, GlobalSearchScope.allScope(project))
         val resolved = PsiUtil.resolveClassInClassTypeOnly(psiType) ?: return false
         return InheritanceUtil.isInheritor(resolved, CommonClassNames.JAVA_UTIL_MAP)
-      }
-
-      override fun calcLabel(descriptor: ValueDescriptor?,
-                             evaluationContext: EvaluationContext?,
-                             labelListener: DescriptorLabelListener?): String {
-        if (isMap()) {
-          val pair = evaluate(evaluationContext!!)
-          val key = pair?.first
-          val value = pair?.second
-          val keyDescriptor = InstanceValueDescriptor(myDebugSession.project, key)
-          val valueDescriptor = InstanceValueDescriptor(myDebugSession.project, value)
-          return "$keyDescriptor -> $valueDescriptor"
-        }
-        return super.calcLabel(descriptor, evaluationContext, labelListener)
       }
     }
   }

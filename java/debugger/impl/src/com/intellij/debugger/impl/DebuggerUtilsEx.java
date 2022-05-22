@@ -370,6 +370,7 @@ public abstract class DebuggerUtilsEx extends DebuggerUtils {
     }
   }
 
+  @ApiStatus.Experimental
   public static void addCollectionHistoryTab(@NotNull XDebugSession session, @NotNull XValueNodeImpl node) {
     XValueContainer container = node.getValueContainer();
     if (container instanceof JavaValue) {
@@ -383,6 +384,7 @@ public abstract class DebuggerUtilsEx extends DebuggerUtils {
     }
   }
 
+  @ApiStatus.Experimental
   public static void addCollectionHistoryTab(@NotNull XDebugSession session,
                                              @NotNull String clsName,
                                              @NotNull String fieldName,
