@@ -25,6 +25,7 @@ public class CollectionBreakpointInstrumentor {
   private static final String IDENTITY_MAP_TYPE = "Ljava/util/IdentityHashMap;";
   private static final String COLLECTION_TYPE = "java/util/Collection";
   private static final String MAP_TYPE = "java/util/Map";
+  private static final String JAVA_UTIL_PREFIX = "java/util";
   private static final String ABSTRACT_COLLECTION_TYPE = "java/util/AbstractCollection";
   private static final String ABSTRACT_LIST_TYPE = "java/util/AbstractList";
   private static final String ARRAY_LIST_TYPE = "java/util/ArrayList";
@@ -60,7 +61,8 @@ public class CollectionBreakpointInstrumentor {
   private static final Set<String> myUnprocessedNestedMembers = new HashSet<String>();
   private static final Map<String, KnownMethodsSet> myCollectionsToTransform = new HashMap<String, KnownMethodsSet>();
 
-  private static final Map<String, String> myNestedCollectionMembers = new HashMap<String, String>();
+  private static final Set<String> myNestedCollectionMembers = new HashSet<String>();
+  private static final Set<String> myProcessedClasses = new HashSet<String>();
   private static final Set<String> myClassesToTransform = new HashSet<String>();
   private static final ReentrantLock myTransformLock = new ReentrantLock();
 
@@ -316,16 +318,20 @@ public class CollectionBreakpointInstrumentor {
   @SuppressWarnings("unused")
   public static void captureFieldModification(Object collectionInstance,
                                               Object clsInstance,
-                                              String clsTypeDesc,
+                                              String clsName,
                                               String fieldName,
                                               boolean shouldSaveStack) {
     try {
       if (collectionInstance == null) {
         return;
       }
+      String fieldOwner = myTrackedFields.getFieldOwnerName(clsName, fieldName);
+      if (fieldOwner == null) {
+        return;
+      }
       myInstanceFilters.add(collectionInstance);
       transformCollectionClassIfNeeded(collectionInstance.getClass());
-      CollectionBreakpointStorage.saveFieldModification(clsTypeDesc, fieldName, clsInstance, collectionInstance, shouldSaveStack);
+      CollectionBreakpointStorage.saveFieldModification(fieldOwner, fieldName, clsInstance, collectionInstance, shouldSaveStack);
     }
     catch (Exception e) {
       e.printStackTrace();
@@ -346,11 +352,14 @@ public class CollectionBreakpointInstrumentor {
   private static void transformClassToCaptureFields(String qualifiedClsName) {
     try {
       myTransformLock.lock();
+      myUnprocessedNestedMembers.clear();
+      myProcessedClasses.clear();
       for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
         String name = cls.getName();
         if (name.equals(qualifiedClsName)) {
           try {
             ourInstrumentation.retransformClasses(cls);
+            myProcessedClasses.add(getInternalClsName(cls));
           }
           catch (UnmodifiableClassException e) {
             e.printStackTrace();
@@ -383,22 +392,24 @@ public class CollectionBreakpointInstrumentor {
   }
 
   private static void transformClassNestedMembers() {
+    myUnprocessedNestedMembers.removeAll(myProcessedClasses);
     while (!myUnprocessedNestedMembers.isEmpty()) {
       myClassesToTransform.addAll(myUnprocessedNestedMembers);
       Set<String> nestedNames = new HashSet<String>(myUnprocessedNestedMembers);
       myUnprocessedNestedMembers.clear();
       transformNestedMembers(nestedNames);
+      myUnprocessedNestedMembers.removeAll(myProcessedClasses);
     }
   }
 
-  private static void transformCollectionNestedMembers(String internalClsName) {
+  private static void transformCollectionNestedMembers() {
+    myUnprocessedNestedMembers.removeAll(myProcessedClasses);
     while (!myUnprocessedNestedMembers.isEmpty()) {
-      for (String nestedName : myUnprocessedNestedMembers) {
-        myNestedCollectionMembers.put(nestedName, internalClsName);
-      }
+      myNestedCollectionMembers.addAll(myUnprocessedNestedMembers);
       Set<String> nestedNames = new HashSet<String>(myUnprocessedNestedMembers);
       myUnprocessedNestedMembers.clear();
       transformNestedMembers(nestedNames);
+      myUnprocessedNestedMembers.removeAll(myProcessedClasses);
     }
   }
 
@@ -408,6 +419,7 @@ public class CollectionBreakpointInstrumentor {
       if (nestedNames.contains(loadedClsName)) {
         try {
           ourInstrumentation.retransformClasses(loadedCls);
+          myProcessedClasses.add(getInternalClsName(loadedCls));
         }
         catch (UnmodifiableClassException e) {
           e.printStackTrace();
@@ -464,7 +476,7 @@ public class CollectionBreakpointInstrumentor {
 
   private static KnownMethodsSet getAllKnownMethods(Class<?> cls, List<Class<?>> supers) {
     String internalClsName = getInternalClsName(cls);
-    boolean fairCheckIsNecessary = !internalClsName.startsWith("java/util");
+    boolean fairCheckIsNecessary = !internalClsName.startsWith(JAVA_UTIL_PREFIX);
 
     if (fairCheckIsNecessary) {
       return new KnownMethodsSet();
@@ -492,6 +504,8 @@ public class CollectionBreakpointInstrumentor {
   private static void transformCollectionClassIfNeeded(Class<?> cls) {
     try {
       myTransformLock.lock();
+      myUnprocessedNestedMembers.clear();
+      myProcessedClasses.clear();
       String internalClsName = getInternalClsName(cls);
       if (myCollectionsToTransform.containsKey(internalClsName)) {
         return;
@@ -506,13 +520,14 @@ public class CollectionBreakpointInstrumentor {
             String name = getInternalClsName(loadedCls);
             myCollectionsToTransform.put(name, getAllKnownMethods(loadedCls, allSupers));
             ourInstrumentation.retransformClasses(loadedCls);
-            transformCollectionNestedMembers(name);
+            myProcessedClasses.add(name);
           }
           catch (UnmodifiableClassException e) {
             e.printStackTrace();
           }
         }
       }
+      transformCollectionNestedMembers();
     }
     catch (Exception e) {
       e.printStackTrace();
@@ -575,7 +590,7 @@ public class CollectionBreakpointInstrumentor {
       }
 
       boolean shouldBeTransformed = myCollectionsToTransform.containsKey(className) ||
-                                    myNestedCollectionMembers.containsKey(className) ||
+                                    myNestedCollectionMembers.contains(className) ||
                                     myClassesToTransform.contains(className);
 
       if (shouldBeTransformed) {
@@ -610,21 +625,37 @@ public class CollectionBreakpointInstrumentor {
     }
 
     @Override
-    public FieldVisitor visitField(int access, String name, String descriptor, String signature, Object value) {
-      return super.visitField(access, name, descriptor, signature, value);
+    public void visitNestHost(String nestHost) {
+      saveClassNestMembersToUnprocessed(nestHost);
+      saveCollectionNestMembersToUnprocessed(nestHost);
+      super.visitNestHost(nestHost);
+    }
+
+    @Override
+    public void visitNestMember(String nestMember) {
+      saveClassNestMembersToUnprocessed(nestMember);
+      saveCollectionNestMembersToUnprocessed(nestMember);
+      super.visitNestMember(nestMember);
     }
 
     @Override
     public void visitInnerClass(String name, String outerName, String innerName, int access) {
-      if (myClassesToTransform.contains(myClsName) && !myClassesToTransform.contains(name)) {
-        myUnprocessedNestedMembers.add(name); // save for processing after transform
-      }
-
-      if (myCollectionsToTransform.containsKey(myClsName) && !myNestedCollectionMembers.containsKey(name)) {
-        myUnprocessedNestedMembers.add(name); // save for processing after transform
-      }
-
+      saveCollectionNestMembersToUnprocessed(name);
       super.visitInnerClass(name, outerName, innerName, access);
+    }
+
+    private void saveCollectionNestMembersToUnprocessed(String nestMemberName) {
+      if ((myCollectionsToTransform.containsKey(myClsName) ||
+           myNestedCollectionMembers.contains(myClsName)) &&
+           nestMemberName.startsWith(JAVA_UTIL_PREFIX)) {
+        myUnprocessedNestedMembers.add(nestMemberName); // save for processing after transform
+      }
+    }
+
+    private void saveClassNestMembersToUnprocessed(String nestMemberName) {
+      if (myClassesToTransform.contains(myClsName)) {
+        myUnprocessedNestedMembers.add(nestMemberName); // save for processing after transform
+      }
     }
 
     @Override
@@ -650,13 +681,12 @@ public class CollectionBreakpointInstrumentor {
         }
 
         Set<String> fieldOwnerTypes = new HashSet<String>();
-        String nestHost = myNestedCollectionMembers.get(myClsName);
-        if (nestHost != null) {
-          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet());
+        if (myNestedCollectionMembers.contains(myClsName)) {
+          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet()); // support for collection nested classes
         }
 
         if (isStaticMethod && myCollectionsToTransform.containsKey(myClsName)) {
-          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet());
+          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet()); // support for collection static methods
         }
 
         if (!fieldOwnerTypes.isEmpty()) {
@@ -1087,11 +1117,10 @@ public class CollectionBreakpointInstrumentor {
         super.visitFieldInsn(opcode, owner, name, descriptor);
       }
 
-      private void visitPutField(MethodVisitor mv, int opcode, String clsName, String fieldName) {
-        String fieldOwner = myTrackedFields.getFieldOwnerName(clsName, fieldName);
-        if (fieldOwner != null) {
+      private void visitPutField(MethodVisitor mv, int opcode, String fieldOwnerName, String fieldName) {
+        if (myTrackedFields.containsField(fieldName)) {
           boolean isStaticField = opcode == Opcodes.PUTSTATIC;
-          addCaptureFieldModificationCode(mv, clsName, fieldOwner, fieldName, isStaticField);
+          addCaptureFieldModificationCode(mv, myClsName, fieldOwnerName, fieldName, isStaticField);
         }
       }
 
@@ -1293,14 +1322,20 @@ public class CollectionBreakpointInstrumentor {
   }
 
   private static class TrackedFields {
-    private final HashMap<String, String> storage = new HashMap<String, String>();
+    private final HashMap<String, String> fieldOwners = new HashMap<String, String>();
+    private final HashSet<String> fieldNames = new HashSet<String>();
 
     public void addField(String fieldOwnerName, String clsName, String fieldName) {
-      storage.put(clsName + fieldName, fieldOwnerName);
+      fieldOwners.put(clsName + fieldName, fieldOwnerName);
+      fieldNames.add(fieldName);
+    }
+
+    public boolean containsField(String fieldName) {
+      return fieldNames.contains(fieldName);
     }
 
     public String getFieldOwnerName(String clsName, String fieldName) {
-      return storage.get(clsName + fieldName);
+      return fieldOwners.get(clsName + fieldName);
     }
   }
 
