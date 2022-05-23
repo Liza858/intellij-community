@@ -643,7 +643,8 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   }
 
   private static Location findLocationInCaptureFieldModificationMethod(ClassType instrumentorCls) {
-    return findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME, CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 5);
+    return findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
+                                CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 7);
   }
 
   private static Location findLocationInDefaultCaptureCollectionModificationMethod(ClassType instrumentorCls) {
