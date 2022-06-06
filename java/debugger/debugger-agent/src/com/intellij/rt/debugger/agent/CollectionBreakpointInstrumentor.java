@@ -43,8 +43,8 @@ public class CollectionBreakpointInstrumentor {
   private static final String ON_CAPTURE_END_NESTED_CLS_METHOD_DESC = "(" + IDENTITY_MAP_TYPE + ")V";
   private static final String CAPTURE_COLLECTION_COPY_METHOD_NAME = "captureCollectionCopy";
   private static final String CAPTURE_COLLECTION_COPY_METHOD_DESC = "(" + "Z" + OBJECT_TYPE + ")" + MULTISET_TYPE;
-  private static final String GET_COPIES_OF_COLLECTION_MAP_METHOD_NAME = "getCopiesOfCollectionsMap";
-  private static final String GET_COPIES_OF_COLLECTION_MAP_METHOD_DESC = "()" + IDENTITY_MAP_TYPE;
+  private static final String GET_COPIES_STORAGE_METHOD_NAME = "getCopiesStorage";
+  private static final String GET_COPIES_STORAGE_METHOD_DESC = "()" + IDENTITY_MAP_TYPE;
   private static final String CONSTRUCTOR_METHOD_NAME = "<init>";
   private static final String CREATE_PAIR_METHOD_NAME = "createPair";
   private static final String CREATE_PAIR_METHOD_DESC = "(" + OBJECT_TYPE + OBJECT_TYPE + ")" + PAIR_TYPE;
@@ -339,7 +339,7 @@ public class CollectionBreakpointInstrumentor {
   }
 
   @SuppressWarnings("unused")
-  public static IdentityHashMap<Object, Multiset> getCopiesOfCollectionsMap() {
+  public static IdentityHashMap<Object, Multiset> getCopiesStorage() {
     try {
       return new IdentityHashMap<Object, Multiset>();
     }
@@ -392,20 +392,17 @@ public class CollectionBreakpointInstrumentor {
   }
 
   private static void transformClassNestedMembers() {
-    myUnprocessedNestedMembers.removeAll(myProcessedClasses);
-    while (!myUnprocessedNestedMembers.isEmpty()) {
-      myClassesToTransform.addAll(myUnprocessedNestedMembers);
-      Set<String> nestedNames = new HashSet<String>(myUnprocessedNestedMembers);
-      myUnprocessedNestedMembers.clear();
-      transformNestedMembers(nestedNames);
-      myUnprocessedNestedMembers.removeAll(myProcessedClasses);
-    }
+    processNestedMembers(myClassesToTransform);
   }
 
   private static void transformCollectionNestedMembers() {
+    processNestedMembers(myNestedCollectionMembers);
+  }
+
+  private static void processNestedMembers(Set<String> members) {
     myUnprocessedNestedMembers.removeAll(myProcessedClasses);
     while (!myUnprocessedNestedMembers.isEmpty()) {
-      myNestedCollectionMembers.addAll(myUnprocessedNestedMembers);
+      members.addAll(myUnprocessedNestedMembers);
       Set<String> nestedNames = new HashSet<String>(myUnprocessedNestedMembers);
       myUnprocessedNestedMembers.clear();
       transformNestedMembers(nestedNames);
@@ -646,8 +643,7 @@ public class CollectionBreakpointInstrumentor {
 
     private void saveCollectionNestMembersToUnprocessed(String nestMemberName) {
       if ((myCollectionsToTransform.containsKey(myClsName) ||
-           myNestedCollectionMembers.contains(myClsName)) &&
-           nestMemberName.startsWith(JAVA_UTIL_PREFIX)) {
+           myNestedCollectionMembers.contains(myClsName))) {
         myUnprocessedNestedMembers.add(nestMemberName); // save for processing after transform
       }
     }
@@ -835,8 +831,8 @@ public class CollectionBreakpointInstrumentor {
         InsnList insList = new InsnList();
         insList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                                        getInstrumentorClassName(),
-                                       GET_COPIES_OF_COLLECTION_MAP_METHOD_NAME,
-                                       GET_COPIES_OF_COLLECTION_MAP_METHOD_DESC,
+                                       GET_COPIES_STORAGE_METHOD_NAME,
+                                       GET_COPIES_STORAGE_METHOD_DESC,
                                        false));
         insList.add(new VarInsnNode(Opcodes.ASTORE, collectionCopiesVar));
 
