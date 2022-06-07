@@ -534,11 +534,12 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  private static void putFieldToCapture(String fieldOwnerClsName, String fieldName, String... unprocessedClasses) {
-    Set<String> unprocessedNames = new HashSet<String>(Arrays.asList(unprocessedClasses));
+  public static void putFieldToCapture(String fieldOwnerTypeDesc, String fieldName, String... classesNames) {
+    String fieldOwnerClsName = getInternalClsName(fieldOwnerTypeDesc);
+    Set<String> classesNamesSet = new HashSet<String>(Arrays.asList(classesNames));
     for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
       String name = cls.getName();
-      if (unprocessedNames.contains(name)) {
+      if (classesNamesSet.contains(name)) {
         putFieldToTrackedIfNeeded(fieldOwnerClsName, fieldName, cls);
         myClassesToTransform.add(getInternalClsName(cls));
       }
@@ -547,8 +548,7 @@ public class CollectionBreakpointInstrumentor {
 
   @SuppressWarnings("unused")
   public static void emulateFieldWatchpoint(String fieldOwnerTypeDesc, String fieldName, String... unprocessedClasses) {
-    String fieldOwnerClsName = getInternalClsName(fieldOwnerTypeDesc);
-    putFieldToCapture(fieldOwnerClsName, fieldName, unprocessedClasses);
+    putFieldToCapture(fieldOwnerTypeDesc, fieldName, unprocessedClasses);
     for (String clsName : unprocessedClasses) {
       transformClassToCaptureFields(clsName);
     }
