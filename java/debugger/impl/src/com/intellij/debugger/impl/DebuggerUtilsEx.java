@@ -369,9 +369,9 @@ public abstract class DebuggerUtilsEx extends DebuggerUtils {
 
   @ApiStatus.Experimental
   public static void addCollectionHistoryTab(@NotNull XDebugSession session, @NotNull XValueNodeImpl node) {
-    XValueContainer container = node.getValueContainer();
+    final @NotNull XValueContainer container = node.getValueContainer();
     if (container instanceof JavaValue) {
-      ValueDescriptorImpl descriptor = ((JavaValue)container).getDescriptor();
+      final @NotNull ValueDescriptorImpl descriptor = ((JavaValue)container).getDescriptor();
       if (descriptor instanceof FieldDescriptor) {
         Field field = ((FieldDescriptor)descriptor).getField();
         String clsName = field.declaringType().name().replace("$", ".");
@@ -386,20 +386,49 @@ public abstract class DebuggerUtilsEx extends DebuggerUtils {
                                              @NotNull String clsName,
                                              @NotNull String fieldName,
                                              @Nullable XValueNodeImpl node) {
-    XDebugProcess process = session.getDebugProcess();
-    RunnerLayoutUi ui = session.getUI();
-    String title = JavaDebuggerBundle.message("collection.history.tab.title", clsName + "." + fieldName);
+    String clsOrInstanceId = null;
+    if (node != null) {
+      clsOrInstanceId = tryGetParentIdLabel(node);
+    }
+    if (clsOrInstanceId == null) {
+      clsOrInstanceId = clsName;
+    }
+
+    final String title = JavaDebuggerBundle.message("collection.history.tab.title", clsOrInstanceId + "." + fieldName);
+    final RunnerLayoutUi ui = session.getUI();
     for (Content content : ui.getContents()) {
       if (title.equals(content.getDisplayName())) {
-        ui.removeContent(content, true);
+        ui.selectAndFocus(content, true, true);
+        return;
       }
     }
-    JComponent view = new CollectionHistoryView(clsName, fieldName, process, node).getComponent();
-    Content content = ui.createContent(title, view, title, null, null);
+
+    final @NotNull XDebugProcess process = session.getDebugProcess();
+    if (!(process instanceof JavaDebugProcess)) {
+      return;
+    }
+    final JComponent view = new CollectionHistoryView(clsName, fieldName, (JavaDebugProcess)process, node).getComponent();
+    final Content content = ui.createContent(title, view, title, null, null);
     content.setCloseable(true);
     content.setDescription(JavaDebuggerBundle.message("collection.history"));
     ui.addContent(content);
     ui.selectAndFocus(content, true, true);
+  }
+
+  private static @Nullable String tryGetParentIdLabel(@NotNull XValueNodeImpl node) {
+    final @NotNull XValueContainer container = node.getValueContainer();
+    if (container instanceof JavaValue) {
+      ValueDescriptorImpl descriptor = ((JavaValue)container).getDescriptor();
+      if (descriptor instanceof FieldDescriptor &&
+          ((FieldDescriptor)descriptor).getField().isStatic()) {
+        return null;
+      }
+      JavaValue parent = ((JavaValue)container).getParent();
+      if (parent != null) {
+        return parent.getDescriptor().getIdLabel();
+      }
+    }
+    return null;
   }
 
   public static StringReference mirrorOfString(@NotNull String s, VirtualMachineProxyImpl virtualMachineProxy, EvaluationContext context)
