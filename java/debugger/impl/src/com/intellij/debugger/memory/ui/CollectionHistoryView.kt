@@ -259,7 +259,6 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
 
     fun loadHistory(fieldParentNode: XValueNodeImpl) {
       myFieldParentNode = fieldParentNode
-      clearHistory()
       loadFieldHistory()
     }
 
@@ -354,10 +353,9 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
     }
 
     private fun loadFieldHistory() {
+      clearHistory()
       myFieldParentNode?.let {
         invokeInDebuggerThread { loadFieldHistory(it) }
-      } ?: run {
-        clearHistory()
       }
     }
 
