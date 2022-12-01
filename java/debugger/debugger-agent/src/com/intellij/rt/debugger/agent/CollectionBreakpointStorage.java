@@ -27,7 +27,7 @@ public class CollectionBreakpointStorage {
     COLLECTION_MODIFICATIONS_STORAGE = new ConcurrentHashMap<CollectionWrapper, CollectionHistory>();
   }
 
-  public static void saveFieldModification(String internalClsName,
+  public static void saveFieldModification(String fieldOwnerClsName,
                                            String fieldName,
                                            Object clsInstance,
                                            Object collectionInstance,
@@ -35,8 +35,7 @@ public class CollectionBreakpointStorage {
     if (!ENABLED) {
       return;
     }
-    String clsName = Type.getObjectType(internalClsName).getClassName();
-    CapturedField field = new CapturedField(clsName, fieldName, clsInstance);
+    CapturedField field = new CapturedField(fieldOwnerClsName, fieldName, clsInstance);
     FIELD_MODIFICATIONS_STORAGE.putIfAbsent(field, new FieldHistory());
     FieldHistory history = FIELD_MODIFICATIONS_STORAGE.get(field);
     Throwable exception = shouldSaveStack ? new Throwable() : null;

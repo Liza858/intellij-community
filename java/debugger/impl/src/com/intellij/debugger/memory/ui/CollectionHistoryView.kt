@@ -62,7 +62,7 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
   private val myMainComponent: JComponent
 
   init {
-    val shouldLoadFieldParents = myCollectionNode == null || fieldIsStatic()
+    val shouldLoadFieldParents = myCollectionNode == null && !fieldIsStatic()
     if (shouldLoadFieldParents) {
       setupFieldParentsTree()
       myMainComponent = JBSplitter(false, SPLITTER_PROPORTION)
@@ -292,8 +292,7 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
                                           selectedNode: XValueNodeImpl): List<StackFrameItem>? {
       val selectedRow = myFieldHistory.root?.children?.indexOf(selectedNode)
       if (selectedRow == null || selectedRow == -1) return null
-      val fieldParent = myFieldParentNode ?: return null
-      val clsInstance = if (!fieldIsStatic()) getObjectReferenceForNode(fieldParent) else null
+      val clsInstance = getObjectReferenceForNode(myFieldParentNode)
       val modificationIndex = vm.mirrorOf(selectedRow)
       val jvmClsName = tryGetJVMClsName(vm) ?: return null
       return CollectionBreakpointUtils.getFieldModificationStack(suspendContext, myFieldName, jvmClsName, clsInstance, modificationIndex)
@@ -341,8 +340,8 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
       return myDebugProcess.suspendManager.pausedContext
     }
 
-    private fun loadFieldHistory(parent: XValueNodeImpl) {
-      val clsInstance = if (!fieldIsStatic()) getObjectReferenceForNode(parent) else null
+    private fun loadFieldHistory(parent: XValueNodeImpl?) {
+      val clsInstance = getObjectReferenceForNode(parent)
       val suspendContext = getSuspendContext() ?: return
       val vm = getVirtualMachine() ?: return
       val jvmClsName = tryGetJVMClsName(vm) ?: return
@@ -354,9 +353,7 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
 
     private fun loadFieldHistory() {
       clearHistory()
-      myFieldParentNode?.let {
-        invokeInDebuggerThread { loadFieldHistory(it) }
-      }
+      invokeInDebuggerThread { loadFieldHistory(myFieldParentNode) }
     }
 
     fun getComponent(): JComponent {

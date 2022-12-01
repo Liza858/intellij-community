@@ -325,13 +325,13 @@ public class CollectionBreakpointInstrumentor {
       if (collectionInstance == null) {
         return;
       }
-      String fieldOwner = myTrackedFields.getFieldOwnerName(clsName, fieldName);
-      if (fieldOwner == null) {
+      String fieldOwnerClsName = myTrackedFields.getFieldOwnerName(clsName, fieldName);
+      if (fieldOwnerClsName == null) {
         return;
       }
       myInstanceFilters.add(collectionInstance);
       transformCollectionClassIfNeeded(collectionInstance.getClass());
-      CollectionBreakpointStorage.saveFieldModification(fieldOwner, fieldName, clsInstance, collectionInstance, shouldSaveStack);
+      CollectionBreakpointStorage.saveFieldModification(fieldOwnerClsName, fieldName, clsInstance, collectionInstance, shouldSaveStack);
     }
     catch (Exception e) {
       e.printStackTrace();
@@ -375,20 +375,22 @@ public class CollectionBreakpointInstrumentor {
 
   private static void putFieldToTrackedIfNeeded(String fieldOwnerClsName, String fieldName, Class<?> cls) {
     Class<?> currentCls = cls;
-    while (!fieldOwnerClsName.equals(getInternalClsName(currentCls)) &&
+    while (!fieldOwnerClsName.equals(currentCls.getName()) &&
            !OBJECT_CLASS_NAME.equals(currentCls.getName())) {
       try {
         currentCls.getDeclaredField(fieldName);
         return;
       }
       catch (NoSuchFieldException e) {
-        currentCls = cls.getSuperclass();
+        currentCls = currentCls.getSuperclass();
       }
       catch (Exception e) {
         return;
       }
     }
-    myTrackedFields.addField(fieldOwnerClsName, getInternalClsName(cls), fieldName);
+    if (fieldOwnerClsName.equals(currentCls.getName())) {
+      myTrackedFields.addField(fieldOwnerClsName, currentCls.getName(), fieldName);
+    }
   }
 
   private static void transformClassNestedMembers() {
@@ -534,8 +536,7 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  public static void putFieldToCapture(String fieldOwnerTypeDesc, String fieldName, String... classesNames) {
-    String fieldOwnerClsName = getInternalClsName(fieldOwnerTypeDesc);
+  public static void putFieldToCapture(String fieldOwnerClsName, String fieldName, String... classesNames) {
     Set<String> classesNamesSet = new HashSet<String>(Arrays.asList(classesNames));
     for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
       String name = cls.getName();
@@ -560,10 +561,6 @@ public class CollectionBreakpointInstrumentor {
 
   private static String getCollectionMethodsWrapperClassName() {
     return getInternalClsName(CollectionMethodsWrapper.class);
-  }
-
-  public static String getInternalClsName(String typeDescriptor) {
-    return Type.getType(typeDescriptor).getInternalName();
   }
 
   public static String getInternalClsName(Class<?> cls) {
