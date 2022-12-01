@@ -389,7 +389,7 @@ public class CollectionBreakpointInstrumentor {
       }
     }
     if (fieldOwnerClsName.equals(currentCls.getName())) {
-      myTrackedFields.addField(fieldOwnerClsName, currentCls.getName(), fieldName);
+      myTrackedFields.addField(fieldOwnerClsName, getInternalClsName(cls), fieldName);
     }
   }
 
@@ -541,6 +541,7 @@ public class CollectionBreakpointInstrumentor {
     for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
       String name = cls.getName();
       if (classesNamesSet.contains(name)) {
+        System.out.println("put f "  + fieldOwnerClsName + " " + fieldName + " " + cls.getName());
         putFieldToTrackedIfNeeded(fieldOwnerClsName, fieldName, cls);
         myClassesToTransform.add(getInternalClsName(cls));
       }
@@ -548,8 +549,8 @@ public class CollectionBreakpointInstrumentor {
   }
 
   @SuppressWarnings("unused")
-  public static void emulateFieldWatchpoint(String fieldOwnerTypeDesc, String fieldName, String... unprocessedClasses) {
-    putFieldToCapture(fieldOwnerTypeDesc, fieldName, unprocessedClasses);
+  public static void emulateFieldWatchpoint(String fieldOwnerClsName, String fieldName, String... unprocessedClasses) {
+    putFieldToCapture(fieldOwnerClsName, fieldName, unprocessedClasses);
     for (String clsName : unprocessedClasses) {
       transformClassToCaptureFields(clsName);
     }
@@ -1318,8 +1319,8 @@ public class CollectionBreakpointInstrumentor {
     private final HashMap<String, String> fieldOwners = new HashMap<String, String>();
     private final HashSet<String> fieldNames = new HashSet<String>();
 
-    public void addField(String fieldOwnerName, String clsName, String fieldName) {
-      fieldOwners.put(clsName + fieldName, fieldOwnerName);
+    public void addField(String fieldOwnerName, String internalClsName, String fieldName) {
+      fieldOwners.put(internalClsName + fieldName, fieldOwnerName);
       fieldNames.add(fieldName);
     }
 
@@ -1327,8 +1328,8 @@ public class CollectionBreakpointInstrumentor {
       return fieldNames.contains(fieldName);
     }
 
-    public String getFieldOwnerName(String clsName, String fieldName) {
-      return fieldOwners.get(clsName + fieldName);
+    public String getFieldOwnerName(String internalClsName, String fieldName) {
+      return fieldOwners.get(internalClsName + fieldName);
     }
   }
 
