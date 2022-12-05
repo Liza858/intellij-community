@@ -322,11 +322,25 @@ public class CollectionBreakpointInstrumentor {
                                               String fieldName,
                                               boolean shouldSaveStack) {
     try {
-      if (collectionInstance == null) {
-        return;
-      }
       String fieldOwnerClsName = myTrackedFields.getFieldOwnerName(clsName, fieldName);
       if (fieldOwnerClsName == null) {
+        return;
+      }
+      captureModification(collectionInstance, clsInstance, clsName, fieldName, shouldSaveStack);
+    }
+    catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
+
+  @SuppressWarnings("unused")
+  public static void captureModification(Object collectionInstance,
+                                         Object clsInstance,
+                                         String fieldOwnerClsName,
+                                         String fieldName,
+                                         boolean shouldSaveStack) {
+    try {
+      if (collectionInstance == null) {
         return;
       }
       myInstanceFilters.add(collectionInstance);
@@ -541,7 +555,6 @@ public class CollectionBreakpointInstrumentor {
     for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
       String name = cls.getName();
       if (classesNamesSet.contains(name)) {
-        System.out.println("put f "  + fieldOwnerClsName + " " + fieldName + " " + cls.getName());
         putFieldToTrackedIfNeeded(fieldOwnerClsName, fieldName, cls);
         myClassesToTransform.add(getInternalClsName(cls));
       }

@@ -14,6 +14,7 @@ import com.intellij.debugger.engine.events.SuspendContextCommandImpl;
 import com.intellij.debugger.engine.requests.RequestManagerImpl;
 import com.intellij.debugger.impl.DebuggerUtilsImpl;
 import com.intellij.debugger.impl.PositionUtil;
+import com.intellij.debugger.impl.PrioritizedTask;
 import com.intellij.debugger.jdi.StackFrameProxyImpl;
 import com.intellij.debugger.jdi.ThreadReferenceProxyImpl;
 import com.intellij.debugger.jdi.VirtualMachineProxyImpl;
@@ -54,9 +55,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
   private static final String EMULATE_FIELD_WATCHPOINT_METHOD_NAME = "emulateFieldWatchpoint";
   private static final String EMULATE_FIELD_WATCHPOINT_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
-  private static final String PUT_FIELD_TO_CAPTURE_METHOD_NAME = "putFieldToCapture";
-  private static final String PUT_FIELD_TO_CAPTURE_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
-  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
+  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureModification";
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
@@ -66,8 +65,9 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   private static final String ON_CAPTURE_END_METHOD_DESC = "(Ljava/util/IdentityHashMap;)V";
   private static final long MAX_INSTANCES_NUMBER = 0;
 
+  private final Set<FilteredRequestor> myAdditionRequestors = Collections.newSetFromMap(new IdentityHashMap<>());
   private final Set<String> myUnprocessedClasses = new HashSet<>();
-  private volatile boolean myFieldOwnerClsPrepared = false;
+  private volatile boolean myFieldOwnerClsPreparedOnce = false;
   private volatile boolean myIsFinal = false;
   private volatile boolean myIsStatic = false;
   private volatile boolean myLineBreakpointsAreSet = false;
@@ -93,11 +93,10 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
       createModificationWatchpointRequest(debugProcess, refType);
       return;
     }
-    if (myFieldOwnerClsPrepared) {
-      return;
+    if (!myFieldOwnerClsPreparedOnce) {
+      createModificationWatchpointRequestEmulated(debugProcess, refType);
+      myFieldOwnerClsPreparedOnce = true;
     }
-    createModificationWatchpointRequestEmulated(debugProcess, refType);
-    myFieldOwnerClsPrepared = true;
   }
 
   @Override
@@ -135,6 +134,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
       return processMethodEntryEvent(context, event);
     }
     else if (event instanceof ModificationWatchpointEvent) {
+      setLineBreakpointsIfNeeded(context);
       return processModificationWatchpointEvent(context, event);
     }
 
@@ -156,14 +156,35 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     }
   }
 
-  public boolean processMethodEntryEvent(@NotNull SuspendContextImpl context, LocatableEvent event) {
-    final @NotNull DebugProcessImpl debugProcess = context.getDebugProcess();
+  @Override
+  public Key<CollectionBreakpoint> getCategory() {
+    return CATEGORY;
+  }
 
+  @Override
+  public @Nullable String getClassName() {
+    return getProperties().myClassName;
+  }
+
+  @Override
+  public String getDisplayName() {
+    return "";
+  }
+
+  public void unregister(@NotNull DebugProcessImpl debugProcess) {
+    debugProcess.getManagerThread().schedule(PrioritizedTask.Priority.HIGH, () -> {
+      RequestManagerImpl requestManager = debugProcess.getRequestsManager();
+      myAdditionRequestors.forEach(requestor -> requestManager.deleteRequest(requestor));
+      requestManager.deleteRequest(this);
+    });
+  }
+
+  private boolean processMethodEntryEvent(@NotNull SuspendContextImpl context, LocatableEvent event) {
     event.request().disable(); // disable method entry request
 
     Location location = event.location();
     if (location == null) {
-      emulateFieldWatchpoint(debugProcess, context);
+      emulateFieldWatchpoint(context);
       return false;
     }
 
@@ -180,7 +201,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
     Set<String> unprocessedClassesCopy = new HashSet<>(myUnprocessedClasses);
 
-    emulateFieldWatchpoint(debugProcess, context);
+    emulateFieldWatchpoint(context);
 
     if (myIsStatic) {
       processClassesInJVM(unprocessedClassesCopy, context, event, place);
@@ -192,13 +213,10 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     return false;
   }
 
-  public boolean processModificationWatchpointEvent(@NotNull SuspendContextImpl context, LocatableEvent event) {
-    @NotNull DebugProcessImpl debugProcess = context.getDebugProcess();
+  private boolean processModificationWatchpointEvent(@NotNull SuspendContextImpl context, LocatableEvent event) {
     @Nullable ObjectReference fieldOwnerInstance = ((ModificationWatchpointEvent)event).object();
     Value valueToBe = ((ModificationWatchpointEvent)event).valueToBe();
-    putFieldToCapture(debugProcess, context);
-    setLineBreakpointsIfNeeded(context);
-    captureFieldModification(valueToBe, fieldOwnerInstance, true, debugProcess, context);
+    captureFieldModification(valueToBe, fieldOwnerInstance, true, context);
     return true;
   }
 
@@ -236,7 +254,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
       myIsStatic = SlowOperations.allowSlowOperations(() -> field.hasModifierProperty(PsiModifier.STATIC));
       setFieldAccessModifier(SlowOperations.allowSlowOperations(() -> getFieldModifier(field)));
     }
-    myFieldOwnerClsPrepared = false;
+    myFieldOwnerClsPreparedOnce = false;
     myLineBreakpointsAreSet = false;
   }
 
@@ -276,7 +294,8 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
                                            @NotNull ReferenceType declaringType,
                                            @Nullable ObjectReference thisObj,
                                            @Nullable ThreadReferenceProxyImpl thread) {
-    MyRequestor requestor = new MyRequestor(getProject());
+    MyRequestor requestor = new MyRequestor();
+    myAdditionRequestors.add(requestor);
     addFieldWatchpoint(requestor, context, declaringType, thisObj);
     createMethodExitRequest(requestor, context, declaringType, thisObj, thread);
   }
@@ -316,7 +335,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     for (ReferenceType cls : classes) {
       if (myFieldOwnerJVMClsName.equals(cls.name())) {
         Field field = cls.fieldByName(fieldName);
-        captureClsField(cls, field, context.getDebugProcess(), context);
+        captureClsField(cls, field, context);
       }
     }
 
@@ -351,7 +370,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     String fieldName = getFieldName();
     for (ObjectReference instance : instances) {
       Field field = instance.referenceType().fieldByName(fieldName);
-      captureInstanceField(instance, field, context.getDebugProcess(), context);
+      captureInstanceField(instance, field, context);
     }
 
     VirtualMachineProxyImpl vm = context.getDebugProcess().getVirtualMachineProxy();
@@ -368,17 +387,17 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     }
   }
 
-  private void captureClsField(ReferenceType cls, Field field, DebugProcessImpl debugProcess, SuspendContextImpl context) {
+  private void captureClsField(ReferenceType cls, Field field, SuspendContextImpl context) {
     Value value = cls.getValue(field);
     if (value != null) {
-      captureFieldModification(value, null, false, debugProcess, context);
+      captureFieldModification(value, null, false, context);
     }
   }
 
-  private void captureInstanceField(ObjectReference instance, Field field, DebugProcessImpl debugProcess, SuspendContextImpl context) {
+  private void captureInstanceField(ObjectReference instance, Field field, SuspendContextImpl context) {
     Value value = instance.getValue(field);
     if (value != null) {
-      captureFieldModification(value, instance, false, debugProcess, context);
+      captureFieldModification(value, instance, false, context);
     }
   }
 
@@ -428,27 +447,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     }
   }
 
-  @Override
-  public Key<CollectionBreakpoint> getCategory() {
-    return CATEGORY;
-  }
-
-  @Override
-  public @Nullable String getClassName() {
-    return getProperties().myClassName;
-  }
-
-  @Override
-  public synchronized @NotNull Project getProject() {
-    return super.getProject();
-  }
-
-  @Override
-  public String getDisplayName() {
-    return "";
-  }
-
-  public synchronized String getFieldName() {
+  private synchronized String getFieldName() {
     return getProperties().myFieldName;
   }
 
@@ -459,7 +458,8 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     if (request == null) {
       request = requestsManager.createMethodEntryRequest(this);
       requestsManager.enableRequest(request);
-    } else if (!request.isEnabled()) {
+    }
+    else if (!request.isEnabled()) {
       requestsManager.enableRequest(request);
     }
   }
@@ -467,7 +467,6 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   private void captureFieldModification(Value valueToBe,
                                         ObjectReference fieldOwnerInstance,
                                         boolean shouldSaveStack,
-                                        DebugProcessImpl debugProcess,
                                         SuspendContextImpl context) {
     StackFrameProxyImpl frameProxy = context.getFrameProxy();
     if (frameProxy == null) {
@@ -490,15 +489,15 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     args.add(fieldNameRef);
     args.add(shouldSaveStackRef);
 
-    CollectionBreakpointUtils.invokeInstrumentorMethod(debugProcess, context,
+    CollectionBreakpointUtils.invokeInstrumentorMethod(context,
                                                        CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
                                                        CAPTURE_FIELD_MODIFICATION_METHOD_DESC,
                                                        args);
   }
 
   // emulate FieldWatchpoint with instrumentation
-  private void emulateFieldWatchpoint(DebugProcessImpl debugProcess, SuspendContextImpl context) {
-    transformClassesToEmulateFieldWatchpoint(debugProcess, context);
+  private void emulateFieldWatchpoint(SuspendContextImpl context) {
+    transformClassesToEmulateFieldWatchpoint(context);
     setLineBreakpointsIfNeeded(context);
   }
 
@@ -509,8 +508,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     }
   }
 
-  private void transformClassesToEmulateFieldWatchpoint(DebugProcessImpl debugProcess,
-                                                        SuspendContextImpl context) {
+  private void transformClassesToEmulateFieldWatchpoint(SuspendContextImpl context) {
     StackFrameProxyImpl frameProxy = context.getFrameProxy();
     String fieldOwnerClsName = myFieldOwnerJVMClsName;
     if (frameProxy == null || fieldOwnerClsName == null) {
@@ -521,35 +519,16 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(getFieldName());
 
     List<Value> clsNamesRef = ContainerUtil.map(myUnprocessedClasses, clsName -> frameProxy.getVirtualMachine().mirrorOf(clsName));
+    myUnprocessedClasses.clear();
 
     List<Value> args = new ArrayList<>();
     args.add(fieldOwnerClsNameRef);
     args.add(fieldNameRef);
     args.addAll(clsNamesRef);
 
-    myUnprocessedClasses.clear();
-    CollectionBreakpointUtils.invokeInstrumentorMethod(debugProcess, context,
+    CollectionBreakpointUtils.invokeInstrumentorMethod(context,
                                                        EMULATE_FIELD_WATCHPOINT_METHOD_NAME,
                                                        EMULATE_FIELD_WATCHPOINT_METHOD_DESC,
-                                                       args);
-  }
-
-  private void putFieldToCapture(DebugProcessImpl debugProcess,
-                                 SuspendContextImpl context) {
-    StackFrameProxyImpl frameProxy = context.getFrameProxy();
-    String fieldOwnerClsName = myFieldOwnerJVMClsName;
-    if (frameProxy == null || fieldOwnerClsName == null) {
-      return;
-    }
-
-    Value fieldOwnerClsNameRef= frameProxy.getVirtualMachine().mirrorOf(fieldOwnerClsName);
-    Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(getFieldName());
-
-    List<Value> args = List.of(fieldOwnerClsNameRef, fieldNameRef, fieldOwnerClsNameRef);
-
-    CollectionBreakpointUtils.invokeInstrumentorMethod(debugProcess, context,
-                                                       PUT_FIELD_TO_CAPTURE_METHOD_NAME,
-                                                       PUT_FIELD_TO_CAPTURE_METHOD_DESC,
                                                        args);
   }
 
@@ -558,16 +537,25 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     EvaluationContextImpl evalContext = new EvaluationContextImpl(context, context.getFrameProxy());
     evalContext = evalContext.withAutoLoadClasses(false);
     ClassType instrumentorCls = CollectionBreakpointUtils.getInstrumentorClass(debugProcess, evalContext);
-    List<Location> locations = findLocationsInInstrumentorMethods(instrumentorCls);
+    List<Location> locations = findLocationsForLineBreakpoints(instrumentorCls);
     for (Location location : locations) {
       SourcePosition position = locationToPosition(context.getDebugProcess(), location);
       MyLineBreakpoint breakpoint = new MyLineBreakpoint(location, position);
+      myAdditionRequestors.add(breakpoint);
       breakpoint.createBreakpointRequest(context);
     }
   }
 
   private boolean suspendOnBreakpointHit() {
     return !DebuggerSettings.SUSPEND_NONE.equals(getSuspendPolicy());
+  }
+
+  private @NotNull List<Location> findLocationsForLineBreakpoints(ClassType instrumentorCls) {
+    List<Location> locations = findLocationsInCollectionModificationsTrackers(instrumentorCls);
+    if (canEmulateFieldWatchpoint()) {
+      locations.addAll(findLocationsInFieldModificationsTrackers(instrumentorCls));
+    }
+    return locations;
   }
 
   private static List<ReferenceType> getTrackedClassesInJVM(SuspendContextImpl context, Set<String> clsNames) {
@@ -640,7 +628,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     }
   }
 
-  private static Location findLocationInMethod(ClassType instrumentorCls, String methodName, String methodDesc, int lineNumber) {
+  private static @Nullable Location findLocationInMethod(ClassType instrumentorCls, String methodName, String methodDesc, int lineNumber) {
     try {
       Method method = DebuggerUtils.findMethod(instrumentorCls, methodName, methodDesc);
       if (method != null) {
@@ -656,45 +644,21 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     return null;
   }
 
-  private static Location findLocationInCaptureFieldModificationMethod(ClassType instrumentorCls) {
-    return findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
-                                CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 7);
-  }
-
-  private static Location findLocationInDefaultCaptureCollectionModificationMethod(ClassType instrumentorCls) {
-    return findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
-                                CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5);
-  }
-
-  private static Location findLocationInSpecialCaptureCollectionModificationMethod(ClassType instrumentorCls) {
-    return findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME,
-                                CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC, 2);
-  }
-
-  private static Location findLocationInOnCaptureStartMethod(ClassType instrumentorCls) {
-    return findLocationInMethod(instrumentorCls, ON_CAPTURE_END_METHOD_NAME,
-                                ON_CAPTURE_END_METHOD_DESC, 8);
-  }
-
-  @NotNull
-  private static List<Location> findLocationsInInstrumentorMethods(ClassType instrumentorCls) {
+  private static @NotNull List<Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
-    Location location = findLocationInCaptureFieldModificationMethod(instrumentorCls);
-    if (location != null) {
-      locations.add(location);
-    }
-    location = findLocationInDefaultCaptureCollectionModificationMethod(instrumentorCls);
-    if (location != null) {
-      locations.add(location);
-    }
-    location = findLocationInSpecialCaptureCollectionModificationMethod(instrumentorCls);
-    if (location != null) {
-      locations.add(location);
-    }
-    location = findLocationInOnCaptureStartMethod(instrumentorCls);
-    if (location != null) {
-      locations.add(location);
-    }
+    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
+                                       CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5));
+    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME,
+                                       CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC, 2));
+    locations.add(findLocationInMethod(instrumentorCls, ON_CAPTURE_END_METHOD_NAME,
+                                       ON_CAPTURE_END_METHOD_DESC, 8));
+    return locations;
+  }
+
+  private static @NotNull List<Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
+    List<Location> locations = new ArrayList<>();
+    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
+                                       CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 8));
     return locations;
   }
 
@@ -729,8 +693,8 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
   private class MyRequestor extends FilteredRequestorImpl {
 
-    private MyRequestor(@NotNull Project project) {
-      super(project);
+    private MyRequestor() {
+      super(CollectionBreakpoint.this.myProject);
     }
 
     @Override
@@ -742,6 +706,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
       if (event instanceof ModificationWatchpointEvent) {
         processModificationWatchpointEvent(context, event);
+        setLineBreakpointsIfNeeded(context);
         return suspendOnBreakpointHit();
       }
       else if (event instanceof MethodExitEvent) {
@@ -755,6 +720,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
       ReferenceType declaringType = event.location().declaringType();
       if (!stackContainsAnyObsoleteMethod(context, declaringType)) {
         debugProcess.getRequestsManager().deleteRequest(this);
+        myAdditionRequestors.remove(this);
       }
     }
   }
@@ -764,7 +730,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     private final @Nullable Location myLocation;
 
     private MyLineBreakpoint(@Nullable Location location, @Nullable SourcePosition position) {
-      super(CollectionBreakpoint.this.getProject());
+      super(CollectionBreakpoint.this.myProject);
       myLocation = location;
       myPosition = position;
       setSuspendPolicy(CollectionBreakpoint.this.getSuspendPolicy());

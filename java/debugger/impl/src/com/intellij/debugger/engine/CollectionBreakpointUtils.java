@@ -121,16 +121,16 @@ public final class CollectionBreakpointUtils {
                                                          String clsName,
                                                          @Nullable Value clsInstance) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl virtualMachineProxy = getVirtualMachine(context);
-    if (virtualMachineProxy == null) {
+    VirtualMachineProxyImpl vm = getVirtualMachine(context);
+    if (vm == null) {
       return Collections.emptyList();
     }
 
-    Value clsNameRef = virtualMachineProxy.mirrorOf(clsName);
-    Value fieldNameRef = virtualMachineProxy.mirrorOf(fieldName);
+    Value clsNameRef = vm.mirrorOf(clsName);
+    Value fieldNameRef = vm.mirrorOf(fieldName);
 
     Value result =
-      invokeStorageMethod(context.getDebugProcess(), context, GET_FIELD_MODIFICATIONS_METHOD_NAME, GET_FIELD_MODIFICATIONS_METHOD_DESC,
+      invokeStorageMethod(context, GET_FIELD_MODIFICATIONS_METHOD_NAME, GET_FIELD_MODIFICATIONS_METHOD_DESC,
                           toList(clsNameRef, fieldNameRef, clsInstance));
 
     if (result instanceof ArrayReference) {
@@ -147,27 +147,27 @@ public final class CollectionBreakpointUtils {
                                                                @Nullable Value collectionInstance,
                                                                IntegerValue modificationIndex) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl virtualMachineProxy = getVirtualMachine(context);
-    if (virtualMachineProxy == null) {
+    VirtualMachineProxyImpl vm = getVirtualMachine(context);
+    if (vm == null) {
       return Collections.emptyList();
     }
 
-    Value clsNameRef = virtualMachineProxy.mirrorOf(clsName);
-    Value fieldNameRef = virtualMachineProxy.mirrorOf(fieldName);
+    Value clsNameRef = vm.mirrorOf(clsName);
+    Value fieldNameRef = vm.mirrorOf(fieldName);
 
-    Value result = invokeStorageMethod(context.getDebugProcess(), context, GET_FIELD_STACK_METHOD_NAME, GET_FIELD_STACK_METHOD_DESC,
+    Value result = invokeStorageMethod(context, GET_FIELD_STACK_METHOD_NAME, GET_FIELD_STACK_METHOD_DESC,
                                        toList(clsNameRef, fieldNameRef, collectionInstance, modificationIndex));
 
     String message = result instanceof StringReference ? ((StringReference)result).value() : "";
 
-    return readStackItems(context.getDebugProcess(), message, virtualMachineProxy);
+    return readStackItems(context.getDebugProcess(), message, vm);
   }
 
   private static List<StackFrameItem> readStackItems(DebugProcessImpl debugProcess,
                                                      String message,
-                                                     VirtualMachineProxyImpl virtualMachineProxy) {
+                                                     VirtualMachineProxyImpl vm) {
     List<StackFrameItem> items = new ArrayList<>();
-    ClassesByNameProvider classesByName = ClassesByNameProvider.createCache(virtualMachineProxy.allClasses());
+    ClassesByNameProvider classesByName = ClassesByNameProvider.createCache(vm.allClasses());
     try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(message.getBytes(StandardCharsets.ISO_8859_1)))) {
       while (dis.available() > 0) {
         String className = dis.readUTF();
@@ -208,12 +208,12 @@ public final class CollectionBreakpointUtils {
   @NotNull
   public static List<Value> getCollectionModificationsHistory(SuspendContextImpl context, Value collectionInstance) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl virtualMachineProxy = getVirtualMachine(context);
-    if (virtualMachineProxy == null) {
+    VirtualMachineProxyImpl vm = getVirtualMachine(context);
+    if (vm == null) {
       return Collections.emptyList();
     }
 
-    Value collectionModifications = invokeStorageMethod(context.getDebugProcess(), context, GET_COLLECTION_MODIFICATIONS_METHOD_NAME,
+    Value collectionModifications = invokeStorageMethod(context, GET_COLLECTION_MODIFICATIONS_METHOD_NAME,
                                                         GET_COLLECTION_MODIFICATIONS_METHOD_DESC,
                                                         Collections.singletonList(collectionInstance));
 
@@ -228,18 +228,18 @@ public final class CollectionBreakpointUtils {
                                                                     @Nullable Value collectionInstance,
                                                                     IntegerValue modificationIndex) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl virtualMachineProxy = getVirtualMachine(context);
-    if (virtualMachineProxy == null) {
+    VirtualMachineProxyImpl vm = getVirtualMachine(context);
+    if (vm == null) {
       return Collections.emptyList();
     }
 
     Value result =
-      invokeStorageMethod(context.getDebugProcess(), context, GET_COLLECTION_STACK_METHOD_NAME, GET_COLLECTION_STACK_METHOD_DESC,
+      invokeStorageMethod(context, GET_COLLECTION_STACK_METHOD_NAME, GET_COLLECTION_STACK_METHOD_DESC,
                           toList(collectionInstance, modificationIndex));
 
     String message = result instanceof StringReference ? ((StringReference)result).value() : "";
 
-    return readStackItems(context.getDebugProcess(), message, virtualMachineProxy);
+    return readStackItems(context.getDebugProcess(), message, vm);
   }
 
   private static List<Value> toList(Value... elements) {
@@ -302,20 +302,18 @@ public final class CollectionBreakpointUtils {
     return null;
   }
 
-  public static Value invokeInstrumentorMethod(DebugProcessImpl debugProcess,
-                                               SuspendContextImpl context,
+  public static Value invokeInstrumentorMethod(SuspendContextImpl context,
                                                String methodName,
                                                String methodDesc,
                                                List<Value> args) {
-    return invokeMethod(debugProcess, context, INSTRUMENTOR_CLS_NAME, methodName, methodDesc, args);
+    return invokeMethod(context, INSTRUMENTOR_CLS_NAME, methodName, methodDesc, args);
   }
 
-  public static Value invokeStorageMethod(DebugProcessImpl debugProcess,
-                                          SuspendContextImpl context,
+  public static Value invokeStorageMethod(SuspendContextImpl context,
                                           String methodName,
                                           String methodDesc,
                                           List<Value> args) {
-    return invokeMethod(debugProcess, context, STORAGE_CLASS_NAME, methodName, methodDesc, args);
+    return invokeMethod(context, STORAGE_CLASS_NAME, methodName, methodDesc, args);
   }
 
   private static ClassType getClass(DebugProcessImpl debugProcess, @Nullable EvaluationContext evalContext, String clsName) {
@@ -337,13 +335,13 @@ public final class CollectionBreakpointUtils {
     return getClass(debugProcess, evalContext, STORAGE_CLASS_NAME);
   }
 
-  private static Value invokeMethod(DebugProcessImpl debugProcess,
-                                    SuspendContextImpl context,
+  private static Value invokeMethod(SuspendContextImpl context,
                                     String clsName,
                                     String methodName,
                                     String methodDesc,
                                     List<Value> args) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
+    DebugProcessImpl debugProcess = context.getDebugProcess();
     EvaluationContextImpl evalContext = new EvaluationContextImpl(context, context.getFrameProxy());
     evalContext = evalContext.withAutoLoadClasses(false);
     try {

@@ -81,5 +81,13 @@ public class JavaBreakpointHandler extends XBreakpointHandler {
     public JavaCollectionBreakpointHandler(DebugProcessImpl process) {
       super(JavaCollectionBreakpointType.class, process);
     }
+
+    @Override
+    public void unregisterBreakpoint(@NotNull XBreakpoint breakpoint, boolean temporary) {
+      final Breakpoint javaBreakpoint = BreakpointManager.getJavaBreakpoint(breakpoint);
+      if (javaBreakpoint instanceof CollectionBreakpoint collectionBreakpoint) {
+        collectionBreakpoint.unregister(myProcess);
+      }
+    }
   }
 }
