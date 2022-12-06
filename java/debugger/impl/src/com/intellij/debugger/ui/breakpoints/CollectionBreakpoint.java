@@ -6,7 +6,6 @@ import com.intellij.debugger.DebuggerManagerEx;
 import com.intellij.debugger.SourcePosition;
 import com.intellij.debugger.engine.CollectionBreakpointUtils;
 import com.intellij.debugger.engine.DebugProcessImpl;
-import com.intellij.debugger.engine.DebuggerUtils;
 import com.intellij.debugger.engine.SuspendContextImpl;
 import com.intellij.debugger.engine.evaluation.EvaluateException;
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl;
@@ -53,18 +52,6 @@ import java.util.stream.Collectors;
 public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollectionBreakpointProperties> {
   @NonNls public static final Key<CollectionBreakpoint> CATEGORY = BreakpointCategory.lookup("collection_breakpoints");
 
-  private static final String EMULATE_FIELD_WATCHPOINT_METHOD_NAME = "emulateFieldWatchpoint";
-  private static final String EMULATE_FIELD_WATCHPOINT_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
-  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
-  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
-  private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME = "transformCollectionAndSaveFieldModification";
-  private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
-  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
-  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
-  private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME = "captureCollectionModification";
-  private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC = "(ZZLjava/lang/Object;Ljava/lang/Object;Z)V";
-  private static final String ON_CAPTURE_END_METHOD_NAME = "onCaptureEnd";
-  private static final String ON_CAPTURE_END_METHOD_DESC = "(Ljava/util/IdentityHashMap;)V";
   private static final long MAX_INSTANCES_NUMBER = 0;
 
   private final Set<FilteredRequestor> myAdditionRequestors = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -471,31 +458,13 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
                                         ObjectReference fieldOwnerInstance,
                                         boolean shouldSaveStack,
                                         SuspendContextImpl context) {
-    StackFrameProxyImpl frameProxy = context.getFrameProxy();
-    if (frameProxy == null) {
-      return;
-    }
-
     String fieldOwnerClsName = myFieldOwnerJVMClsName;
     if (fieldOwnerClsName == null) {
       return;
     }
 
-    Value fieldOwnerClsNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldOwnerClsName);
-    Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(getFieldName());
-    Value shouldSaveStackRef = frameProxy.getVirtualMachine().mirrorOf(shouldSaveStack);
-
-    ArrayList<Value> args = new ArrayList<>();
-    args.add(valueToBe);
-    args.add(fieldOwnerInstance);
-    args.add(fieldOwnerClsNameRef);
-    args.add(fieldNameRef);
-    args.add(shouldSaveStackRef);
-
-    CollectionBreakpointUtils.invokeInstrumentorMethod(context,
-                                                       TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME,
-                                                       TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC,
-                                                       args);
+    CollectionBreakpointUtils.captureFieldModification(context, fieldOwnerClsName, getFieldName(),
+                                                       valueToBe, fieldOwnerInstance, shouldSaveStack);
   }
 
   private void setLineBreakpointsIfNeeded(SuspendContextImpl context) {
@@ -513,21 +482,9 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
       return;
     }
 
-    Value fieldOwnerClsNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldOwnerClsName);
-    Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(getFieldName());
-
-    List<Value> clsNamesRef = ContainerUtil.map(myUnprocessedClasses, clsName -> frameProxy.getVirtualMachine().mirrorOf(clsName));
+    Set<String> unprocessedClasses = new HashSet<>(myUnprocessedClasses);
     myUnprocessedClasses.clear();
-
-    List<Value> args = new ArrayList<>();
-    args.add(fieldOwnerClsNameRef);
-    args.add(fieldNameRef);
-    args.addAll(clsNamesRef);
-
-    CollectionBreakpointUtils.invokeInstrumentorMethod(context,
-                                                       EMULATE_FIELD_WATCHPOINT_METHOD_NAME,
-                                                       EMULATE_FIELD_WATCHPOINT_METHOD_DESC,
-                                                       args);
+    CollectionBreakpointUtils.emulateFieldWatchpoint(context, fieldOwnerClsName, getFieldName(), unprocessedClasses);
   }
 
   private void setLineBreakpoints(SuspendContextImpl context) {
@@ -549,9 +506,9 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   }
 
   private @NotNull List<Location> findLocationsForLineBreakpoints(ClassType instrumentorCls) {
-    List<@Nullable Location> locations = findLocationsInCollectionModificationsTrackers(instrumentorCls);
+    List<@Nullable Location> locations = CollectionBreakpointUtils.findLocationsInCollectionModificationsTrackers(instrumentorCls);
     if (canEmulateFieldWatchpoint()) {
-      locations.addAll(findLocationsInFieldModificationsTrackers(instrumentorCls));
+      locations.addAll(CollectionBreakpointUtils.findLocationsInFieldModificationsTrackers(instrumentorCls));
     }
     if (locations.contains(null)) {
       DebuggerUtilsImpl.logError(new RuntimeException("can't find locations for line breakpoints in instrumentor methods"));
@@ -628,40 +585,6 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     catch (final EvaluateException e) {
       return false;
     }
-  }
-
-  private static @Nullable Location findLocationInMethod(ClassType instrumentorCls, String methodName, String methodDesc, int lineNumber) {
-    try {
-      Method method = DebuggerUtils.findMethod(instrumentorCls, methodName, methodDesc);
-      if (method != null) {
-        List<Location> lines = method.allLineLocations();
-        if (lines.size() >= lineNumber + 1) {
-          return lines.get(lineNumber);
-        }
-      }
-    }
-    catch (AbsentInformationException e) {
-      DebuggerUtilsImpl.logError(e);
-    }
-    return null;
-  }
-
-  private static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
-    List<Location> locations = new ArrayList<>();
-    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
-                                       CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5));
-    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME,
-                                       CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC, 2));
-    locations.add(findLocationInMethod(instrumentorCls, ON_CAPTURE_END_METHOD_NAME,
-                                       ON_CAPTURE_END_METHOD_DESC, 8));
-    return locations;
-  }
-
-  private static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
-    List<Location> locations = new ArrayList<>();
-    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
-                                       CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 3));
-    return locations;
   }
 
   private static @Nullable SourcePosition locationToPosition(DebugProcessImpl debugProcess, @Nullable Location location) {

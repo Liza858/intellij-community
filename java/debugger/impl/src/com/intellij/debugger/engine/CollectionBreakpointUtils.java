@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 @ApiStatus.Experimental
 public final class CollectionBreakpointUtils {
@@ -43,6 +44,18 @@ public final class CollectionBreakpointUtils {
   private static final String ENABLE_DEBUG_MODE_FIELD = "DEBUG";
   private static final String ENABLE_HISTORY_SAVING_FIELD = "ENABLED";
 
+  private static final String EMULATE_FIELD_WATCHPOINT_METHOD_NAME = "emulateFieldWatchpoint";
+  private static final String EMULATE_FIELD_WATCHPOINT_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
+  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
+  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
+  private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME = "transformCollectionAndSaveFieldModification";
+  private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
+  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
+  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
+  private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME = "captureCollectionModification";
+  private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC = "(ZZLjava/lang/Object;Ljava/lang/Object;Z)V";
+  private static final String ON_CAPTURE_END_METHOD_NAME = "onCaptureEnd";
+  private static final String ON_CAPTURE_END_METHOD_DESC = "(Ljava/util/IdentityHashMap;)V";
   private static final String GET_FIELD_MODIFICATIONS_METHOD_NAME = "getFieldModifications";
   private static final String GET_FIELD_MODIFICATIONS_METHOD_DESC = "(" + STRING_TYPE + STRING_TYPE + OBJECT_TYPE + ")[" + OBJECT_TYPE;
   private static final String GET_COLLECTION_MODIFICATIONS_METHOD_NAME = "getCollectionModifications";
@@ -300,6 +313,92 @@ public final class CollectionBreakpointUtils {
       }
     }
     return null;
+  }
+
+  public static void captureFieldModification(SuspendContextImpl context,
+                                              String fieldOwnerClsName,
+                                              String fieldName,
+                                              Value valueToBe,
+                                              ObjectReference fieldOwnerInstance,
+                                              boolean shouldSaveStack) {
+    DebuggerManagerThreadImpl.assertIsManagerThread();
+    StackFrameProxyImpl frameProxy = context.getFrameProxy();
+    if (frameProxy == null) {
+      return;
+    }
+
+    Value fieldOwnerClsNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldOwnerClsName);
+    Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldName);
+    Value shouldSaveStackRef = frameProxy.getVirtualMachine().mirrorOf(shouldSaveStack);
+
+    ArrayList<Value> args = new ArrayList<>();
+    args.add(valueToBe);
+    args.add(fieldOwnerInstance);
+    args.add(fieldOwnerClsNameRef);
+    args.add(fieldNameRef);
+    args.add(shouldSaveStackRef);
+
+    invokeInstrumentorMethod(context, TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME,
+                             TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC, args);
+  }
+
+  public static void emulateFieldWatchpoint(SuspendContextImpl context,
+                                            String fieldOwnerClsName,
+                                            String fieldName,
+                                            Set<String> unprocessedClasses) {
+    StackFrameProxyImpl frameProxy = context.getFrameProxy();
+    if (frameProxy == null) {
+      return;
+    }
+
+    Value fieldOwnerClsNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldOwnerClsName);
+    Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldName);
+
+    List<Value> clsNamesRef = ContainerUtil.map(unprocessedClasses, clsName -> frameProxy.getVirtualMachine().mirrorOf(clsName));
+
+    List<Value> args = new ArrayList<>();
+    args.add(fieldOwnerClsNameRef);
+    args.add(fieldNameRef);
+    args.addAll(clsNamesRef);
+
+    invokeInstrumentorMethod(context,
+                             EMULATE_FIELD_WATCHPOINT_METHOD_NAME,
+                             EMULATE_FIELD_WATCHPOINT_METHOD_DESC,
+                             args);
+  }
+
+  private static @Nullable Location findLocationInMethod(ClassType instrumentorCls, String methodName, String methodDesc, int lineNumber) {
+    try {
+      Method method = DebuggerUtils.findMethod(instrumentorCls, methodName, methodDesc);
+      if (method != null) {
+        List<Location> lines = method.allLineLocations();
+        if (lines.size() >= lineNumber + 1) {
+          return lines.get(lineNumber);
+        }
+      }
+    }
+    catch (AbsentInformationException e) {
+      DebuggerUtilsImpl.logError(e);
+    }
+    return null;
+  }
+
+  public static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
+    List<Location> locations = new ArrayList<>();
+    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
+                                       CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5));
+    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME,
+                                       CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC, 2));
+    locations.add(findLocationInMethod(instrumentorCls, ON_CAPTURE_END_METHOD_NAME,
+                                       ON_CAPTURE_END_METHOD_DESC, 8));
+    return locations;
+  }
+
+  public static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
+    List<Location> locations = new ArrayList<>();
+    locations.add(findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
+                                       CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 3));
+    return locations;
   }
 
   public static Value invokeInstrumentorMethod(SuspendContextImpl context,
