@@ -55,8 +55,10 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
   private static final String EMULATE_FIELD_WATCHPOINT_METHOD_NAME = "emulateFieldWatchpoint";
   private static final String EMULATE_FIELD_WATCHPOINT_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
-  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureModification";
+  private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
+  private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME = "transformCollectionAndSaveFieldModification";
+  private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME = "captureCollectionModification";
@@ -130,11 +132,12 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
       return false;
     }
 
+    setLineBreakpointsIfNeeded(context);
+
     if (event instanceof MethodEntryEvent) {
       return processMethodEntryEvent(context, event);
     }
     else if (event instanceof ModificationWatchpointEvent) {
-      setLineBreakpointsIfNeeded(context);
       return processModificationWatchpointEvent(context, event);
     }
 
@@ -490,15 +493,9 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     args.add(shouldSaveStackRef);
 
     CollectionBreakpointUtils.invokeInstrumentorMethod(context,
-                                                       CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
-                                                       CAPTURE_FIELD_MODIFICATION_METHOD_DESC,
+                                                       TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME,
+                                                       TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC,
                                                        args);
-  }
-
-  // emulate FieldWatchpoint with instrumentation
-  private void emulateFieldWatchpoint(SuspendContextImpl context) {
-    transformClassesToEmulateFieldWatchpoint(context);
-    setLineBreakpointsIfNeeded(context);
   }
 
   private void setLineBreakpointsIfNeeded(SuspendContextImpl context) {
@@ -508,7 +505,8 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     }
   }
 
-  private void transformClassesToEmulateFieldWatchpoint(SuspendContextImpl context) {
+  // emulate FieldWatchpoint with instrumentation
+  private void emulateFieldWatchpoint(SuspendContextImpl context) {
     StackFrameProxyImpl frameProxy = context.getFrameProxy();
     String fieldOwnerClsName = myFieldOwnerJVMClsName;
     if (frameProxy == null || fieldOwnerClsName == null) {
@@ -551,9 +549,13 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   }
 
   private @NotNull List<Location> findLocationsForLineBreakpoints(ClassType instrumentorCls) {
-    List<Location> locations = findLocationsInCollectionModificationsTrackers(instrumentorCls);
+    List<@Nullable Location> locations = findLocationsInCollectionModificationsTrackers(instrumentorCls);
     if (canEmulateFieldWatchpoint()) {
       locations.addAll(findLocationsInFieldModificationsTrackers(instrumentorCls));
+    }
+    if (locations.contains(null)) {
+      DebuggerUtilsImpl.logError(new RuntimeException("can't find locations for line breakpoints in instrumentor methods"));
+      return Collections.emptyList();
     }
     return locations;
   }
@@ -644,7 +646,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     return null;
   }
 
-  private static @NotNull List<Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
+  private static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
     locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
                                        CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5));
@@ -655,10 +657,10 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
     return locations;
   }
 
-  private static @NotNull List<Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
+  private static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
     locations.add(findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
-                                       CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 8));
+                                       CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 3));
     return locations;
   }
 
@@ -706,7 +708,6 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
       if (event instanceof ModificationWatchpointEvent) {
         processModificationWatchpointEvent(context, event);
-        setLineBreakpointsIfNeeded(context);
         return suspendOnBreakpointHit();
       }
       else if (event instanceof MethodExitEvent) {

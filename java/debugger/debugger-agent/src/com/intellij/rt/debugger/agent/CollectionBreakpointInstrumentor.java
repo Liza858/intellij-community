@@ -326,7 +326,7 @@ public class CollectionBreakpointInstrumentor {
       if (fieldOwnerClsName == null) {
         return;
       }
-      captureModification(collectionInstance, clsInstance, clsName, fieldName, shouldSaveStack);
+      transformCollectionAndSaveFieldModification(collectionInstance, clsInstance, fieldOwnerClsName, fieldName, shouldSaveStack);
     }
     catch (Exception e) {
       e.printStackTrace();
@@ -334,11 +334,11 @@ public class CollectionBreakpointInstrumentor {
   }
 
   @SuppressWarnings("unused")
-  public static void captureModification(Object collectionInstance,
-                                         Object clsInstance,
-                                         String fieldOwnerClsName,
-                                         String fieldName,
-                                         boolean shouldSaveStack) {
+  public static void transformCollectionAndSaveFieldModification(Object collectionInstance,
+                                                                 Object clsInstance,
+                                                                 String fieldOwnerClsName,
+                                                                 String fieldName,
+                                                                 boolean shouldSaveStack) {
     try {
       if (collectionInstance == null) {
         return;
