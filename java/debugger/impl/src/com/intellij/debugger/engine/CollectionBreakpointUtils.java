@@ -383,7 +383,7 @@ public final class CollectionBreakpointUtils {
     return null;
   }
 
-  public static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
+  private static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
     locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
                                        CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5));
@@ -394,10 +394,27 @@ public final class CollectionBreakpointUtils {
     return locations;
   }
 
-  public static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
+  private static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
     locations.add(findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
                                        CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 3));
+    return locations;
+  }
+
+  public static @NotNull List<Location> findLocationsForLineBreakpoints(SuspendContextImpl context,
+                                                                        boolean fieldWatchpointIsEmulated) {
+    DebugProcessImpl debugProcess = context.getDebugProcess();
+    EvaluationContextImpl evalContext = new EvaluationContextImpl(context, context.getFrameProxy());
+    evalContext = evalContext.withAutoLoadClasses(false);
+    ClassType instrumentorCls = getInstrumentorClass(debugProcess, evalContext);
+    List<@Nullable Location> locations = findLocationsInCollectionModificationsTrackers(instrumentorCls);
+    if (fieldWatchpointIsEmulated) {
+      locations.addAll(findLocationsInFieldModificationsTrackers(instrumentorCls));
+    }
+    if (locations.contains(null)) {
+      DebuggerUtilsImpl.logError(new RuntimeException("can't find locations for line breakpoints in instrumentor methods"));
+      return Collections.emptyList();
+    }
     return locations;
   }
 

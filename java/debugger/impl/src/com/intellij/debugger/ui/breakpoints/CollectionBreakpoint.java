@@ -6,6 +6,7 @@ import com.intellij.debugger.DebuggerManagerEx;
 import com.intellij.debugger.SourcePosition;
 import com.intellij.debugger.engine.CollectionBreakpointUtils;
 import com.intellij.debugger.engine.DebugProcessImpl;
+import com.intellij.debugger.engine.DebuggerUtils;
 import com.intellij.debugger.engine.SuspendContextImpl;
 import com.intellij.debugger.engine.evaluation.EvaluateException;
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl;
@@ -488,11 +489,7 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
   }
 
   private void setLineBreakpoints(SuspendContextImpl context) {
-    DebugProcessImpl debugProcess = context.getDebugProcess();
-    EvaluationContextImpl evalContext = new EvaluationContextImpl(context, context.getFrameProxy());
-    evalContext = evalContext.withAutoLoadClasses(false);
-    ClassType instrumentorCls = CollectionBreakpointUtils.getInstrumentorClass(debugProcess, evalContext);
-    List<Location> locations = findLocationsForLineBreakpoints(instrumentorCls);
+    List<Location> locations = CollectionBreakpointUtils.findLocationsForLineBreakpoints(context, canEmulateFieldWatchpoint());
     for (Location location : locations) {
       SourcePosition position = locationToPosition(context.getDebugProcess(), location);
       MyLineBreakpoint breakpoint = new MyLineBreakpoint(location, position);
@@ -503,18 +500,6 @@ public class CollectionBreakpoint extends BreakpointWithHighlighter<JavaCollecti
 
   private boolean suspendOnBreakpointHit() {
     return !DebuggerSettings.SUSPEND_NONE.equals(getSuspendPolicy());
-  }
-
-  private @NotNull List<Location> findLocationsForLineBreakpoints(ClassType instrumentorCls) {
-    List<@Nullable Location> locations = CollectionBreakpointUtils.findLocationsInCollectionModificationsTrackers(instrumentorCls);
-    if (canEmulateFieldWatchpoint()) {
-      locations.addAll(CollectionBreakpointUtils.findLocationsInFieldModificationsTrackers(instrumentorCls));
-    }
-    if (locations.contains(null)) {
-      DebuggerUtilsImpl.logError(new RuntimeException("can't find locations for line breakpoints in instrumentor methods"));
-      return Collections.emptyList();
-    }
-    return locations;
   }
 
   private static List<ReferenceType> getTrackedClassesInJVM(SuspendContextImpl context, Set<String> clsNames) {
