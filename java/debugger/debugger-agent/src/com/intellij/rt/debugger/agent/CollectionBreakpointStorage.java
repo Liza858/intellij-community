@@ -1,84 +1,186 @@
 // Copyright 2000-2022 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
 package com.intellij.rt.debugger.agent;
 
-
-import org.jetbrains.capture.org.objectweb.asm.Type;
+import com.intellij.rt.debugger.agent.util.IdentityWrapper;
+import com.intellij.rt.debugger.agent.util.Utils;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+@SuppressWarnings({"UseOfSystemOutOrSystemErr"})
 public class CollectionBreakpointStorage {
-  private static final ConcurrentMap<CapturedField, FieldHistory> FIELD_MODIFICATIONS_STORAGE;
-  private static final ConcurrentMap<CollectionWrapper, CollectionHistory> COLLECTION_MODIFICATIONS_STORAGE;
+  @SuppressWarnings("SSBasedInspection")
   private static final Object[] EMPTY_OBJECT_ARRAY = new Object[0];
   private static final String INSTRUMENTOR_PACKAGE = "com.intellij.rt.debugger.agent";
 
-  private static boolean ENABLED; // set from debugger
+  private static final ConcurrentMap<CapturedField, FieldHistory> FIELD_MODIFICATIONS_STORAGE;
+  private static final ConcurrentMap<IdentityWrapper, CollectionHistory> COLLECTION_MODIFICATIONS_STORAGE;
+
+  private static final Set<String> SAVE_HISTORY_FOR_FIELDS;
+  private static final ConcurrentMap<IdentityWrapper, Set<String>> COLLECTION_TRACKERS;
+
+  private static final ReadWriteLock mySettingsLock = new ReentrantReadWriteLock();
 
   static {
-    FIELD_MODIFICATIONS_STORAGE = new ConcurrentHashMap<CapturedField, FieldHistory>();
-    COLLECTION_MODIFICATIONS_STORAGE = new ConcurrentHashMap<CollectionWrapper, CollectionHistory>();
+    FIELD_MODIFICATIONS_STORAGE = new ConcurrentHashMap<>();
+    COLLECTION_MODIFICATIONS_STORAGE = new ConcurrentHashMap<>();
+    SAVE_HISTORY_FOR_FIELDS = Utils.newConcurrentSet();
+    COLLECTION_TRACKERS = new ConcurrentHashMap<>();
   }
 
+  public static void init() {
+    if (CollectionBreakpointInstrumentor.DEBUG) {
+      System.out.println("Collection breakpoint storage: ready");
+    }
+  }
+
+  // called from the user process or from debugger
   public static void saveFieldModification(String fieldOwnerClsName,
                                            String fieldName,
                                            Object clsInstance,
                                            Object collectionInstance,
                                            boolean shouldSaveStack) {
-    if (!ENABLED) {
-      return;
+    mySettingsLock.readLock().lock();
+    try {
+      if (!shouldSaveHistory(fieldOwnerClsName + fieldName)) {
+        return;
+      }
+
+      CapturedField field = new CapturedField(fieldOwnerClsName, fieldName, clsInstance);
+      FIELD_MODIFICATIONS_STORAGE.putIfAbsent(field, new FieldHistory());
+      FieldHistory history = FIELD_MODIFICATIONS_STORAGE.get(field);
+      Throwable exception = shouldSaveStack ? new Throwable() : null;
+      history.add(new FieldModificationInfo(exception, collectionInstance));
+
+      if (collectionInstance == null) {
+        return;
+      }
+
+      IdentityWrapper wrapper = new IdentityWrapper(collectionInstance);
+      COLLECTION_TRACKERS.putIfAbsent(wrapper, Utils.<String>newConcurrentSet());
+      Set<String> trackers = COLLECTION_TRACKERS.get(wrapper);
+      trackers.add(fieldOwnerClsName + fieldName);
+    } finally {
+      mySettingsLock.readLock().unlock();
     }
-    CapturedField field = new CapturedField(fieldOwnerClsName, fieldName, clsInstance);
-    FIELD_MODIFICATIONS_STORAGE.putIfAbsent(field, new FieldHistory());
-    FieldHistory history = FIELD_MODIFICATIONS_STORAGE.get(field);
-    Throwable exception = shouldSaveStack ? new Throwable() : null;
-    history.add(new FieldModificationInfo(exception, collectionInstance));
   }
 
-  public static void saveCollectionModification(Object collectionInstance, Object elem, boolean isAddition) {
-    if (!ENABLED) {
-      return;
+  // called from the user process
+  public static void saveCollectionModification(Object collectionInstance,
+                                                Object elem,
+                                                boolean isAddition) {
+    mySettingsLock.readLock().lock();
+    try {
+      IdentityWrapper wrapper = new IdentityWrapper(collectionInstance);
+      if (!shouldSaveHistory(wrapper)) {
+        return;
+      }
+      COLLECTION_MODIFICATIONS_STORAGE.putIfAbsent(wrapper, new CollectionHistory());
+      CollectionHistory history = COLLECTION_MODIFICATIONS_STORAGE.get(wrapper);
+      Throwable exception = new Throwable();
+      history.add(new CollectionModificationInfo(exception, elem, isAddition));
+    } finally {
+      mySettingsLock.readLock().unlock();
     }
-    CollectionWrapper wrapper = new CollectionWrapper(collectionInstance);
-    COLLECTION_MODIFICATIONS_STORAGE.putIfAbsent(wrapper, new CollectionHistory());
-    CollectionHistory history = COLLECTION_MODIFICATIONS_STORAGE.get(wrapper);
-    Throwable exception = new Throwable();
-    history.add(new CollectionModificationInfo(exception, elem, isAddition));
   }
 
-  @SuppressWarnings("unused")
+  @SuppressWarnings("unused") // called from debugger
+  public static void setSavingHistoryForFieldEnabled(String fieldOwnerClsName,
+                                                     String fieldName,
+                                                     boolean enabled) {
+    mySettingsLock.writeLock().lock();
+    try {
+      String fieldIdentifier = fieldOwnerClsName + fieldName;
+      if (enabled) {
+        SAVE_HISTORY_FOR_FIELDS.add(fieldIdentifier);
+      } else {
+        SAVE_HISTORY_FOR_FIELDS.remove(fieldIdentifier);
+      }
+    } finally {
+      mySettingsLock.writeLock().unlock();
+    }
+  }
+
+  @SuppressWarnings("unused") // called from debugger
+  public static void clearHistoryForField(String fieldOwnerClsName, String fieldName) {
+    mySettingsLock.writeLock().lock();
+    try {
+      String fieldIdentifier = fieldOwnerClsName + fieldName;
+
+      // remove from field storage
+      Iterator<CapturedField> it = FIELD_MODIFICATIONS_STORAGE.keySet().iterator();
+      while (it.hasNext()) {
+        CapturedField field = it.next();
+        if (fieldIdentifier.equals(field.myFieldOwnerClsName + field.myFieldName)) {
+          it.remove();
+        }
+      }
+
+      // remove from collection storage
+      for (Map.Entry<IdentityWrapper, Set<String>> entry : COLLECTION_TRACKERS.entrySet()) {
+        Set<String> trackers = entry.getValue();
+        trackers.remove(fieldIdentifier);
+        if (trackers.isEmpty()) {
+          IdentityWrapper wrapper = entry.getKey();
+          COLLECTION_MODIFICATIONS_STORAGE.remove(wrapper);
+          COLLECTION_TRACKERS.remove(wrapper);
+        }
+      }
+    } finally {
+      mySettingsLock.writeLock().unlock();
+    }
+  }
+
+  @SuppressWarnings("unused") // called from debugger
   public static Object[] getCollectionModifications(Object collectionInstance) {
-    CollectionWrapper wrapper = new CollectionWrapper(collectionInstance);
+    IdentityWrapper wrapper = new IdentityWrapper(collectionInstance);
     CollectionHistory history = COLLECTION_MODIFICATIONS_STORAGE.get(wrapper);
     return history == null ? EMPTY_OBJECT_ARRAY : history.get();
   }
 
-  @SuppressWarnings("unused")
+  @SuppressWarnings("unused") // called from debugger
   public static Object[] getFieldModifications(String clsName, String fieldName, Object clsInstance) {
     CapturedField field = new CapturedField(clsName, fieldName, clsInstance);
     FieldHistory history = FIELD_MODIFICATIONS_STORAGE.get(field);
     return history == null ? EMPTY_OBJECT_ARRAY : history.getCollectionInstances();
   }
 
-  @SuppressWarnings("unused")
+  @SuppressWarnings("unused") // called from debugger
   public static String getStack(Object collectionInstance, int modificationIndex) throws IOException {
-    CollectionWrapper wrapper = new CollectionWrapper(collectionInstance);
+    IdentityWrapper wrapper = new IdentityWrapper(collectionInstance);
     CollectionHistory history = COLLECTION_MODIFICATIONS_STORAGE.get(wrapper);
     return history == null ? "" : wrapInString(history.get(modificationIndex));
   }
 
-  @SuppressWarnings("unused")
+  @SuppressWarnings("unused") // called from debugger
   public static String getStack(String clsName, String fieldName, Object clsInstance, int modificationIndex) throws IOException {
     CapturedField field = new CapturedField(clsName, fieldName, clsInstance);
     FieldHistory history = FIELD_MODIFICATIONS_STORAGE.get(field);
     return history == null ? "" : wrapInString(history.get(modificationIndex));
+  }
+
+  private static boolean shouldSaveHistory(String fieldIdentifier) {
+    return SAVE_HISTORY_FOR_FIELDS.contains(fieldIdentifier);
+  }
+
+  private static boolean shouldSaveHistory(IdentityWrapper identityWrapper) {
+    Set<String> trackers = COLLECTION_TRACKERS.get(identityWrapper);
+    if (trackers == null) {
+      return false;
+    }
+    for (String trackerId : trackers) {
+      if (SAVE_HISTORY_FOR_FIELDS.contains(trackerId)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static String wrapInString(CapturedStackInfo info) throws IOException {
@@ -229,49 +331,32 @@ public class CollectionBreakpointStorage {
     }
   }
 
-  private static class CollectionWrapper {
-    private final Object myCollectionInstance;
-
-    private CollectionWrapper(Object collectionInstance) {
-      myCollectionInstance = collectionInstance;
-    }
-
-    @Override
-    public boolean equals(Object obj) {
-      return obj instanceof CollectionWrapper &&
-             ((CollectionWrapper)obj).myCollectionInstance == myCollectionInstance;
-    }
-
-    @Override
-    public int hashCode() {
-      return System.identityHashCode(myCollectionInstance);
-    }
-  }
-
   private static class CapturedField {
-    final String myClsName;
-    final String myFieldName;
-    final Object myClsInstance;
+    private final String myFieldOwnerClsName;
+    private final String myFieldName;
+    private final Object myClsInstance;
+    private final int myHashCode;
 
-    private CapturedField(String clsName, String fieldName, Object clsInstance) {
-      myClsName = clsName;
+    private CapturedField(String fieldOwnerClsName, String fieldName, Object clsInstance) {
+      myFieldOwnerClsName = fieldOwnerClsName;
       myFieldName = fieldName;
       myClsInstance = clsInstance;
+      myHashCode = 31 * System.identityHashCode(clsInstance) + Objects.hash(myFieldOwnerClsName, myFieldName);
     }
 
     @Override
-    public boolean equals(Object obj) {
-      return obj instanceof CapturedField &&
-             myClsInstance == ((CapturedField)obj).myClsInstance &&
-             myFieldName.equals(((CapturedField)obj).myFieldName) &&
-             myClsName.equals(((CapturedField)obj).myClsName);
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      CapturedField field = (CapturedField)o;
+      return myClsInstance == field.myClsInstance &&
+             myFieldOwnerClsName.equals(field.myFieldOwnerClsName) &&
+             myFieldName.equals(field.myFieldName);
     }
 
     @Override
     public int hashCode() {
-      return 31 * myFieldName.hashCode() +
-             13 * myClsName.hashCode() +
-             System.identityHashCode(myClsInstance);
+      return myHashCode;
     }
   }
 }

@@ -218,17 +218,15 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
 
       val collectionModifications = CollectionBreakpointUtils.getCollectionModificationsHistory(suspendContext, collectionInstance)
 
-      val nodes = collectionModifications.filterIsInstance<ObjectReference>().mapNotNull {
-          val modificationInfo = CollectionBreakpointUtils.getCollectionModificationInfo(myDebugProcess, evaluationContext, it)
-          val element = modificationInfo?.first
-          val isAddition = modificationInfo?.second
-          if (element != null && isAddition != null) Pair(element, isAddition) else null
+      val nodes = collectionModifications
+        .filterIsInstance<ObjectReference>().mapNotNull {
+          CollectionBreakpointUtils.getCollectionModificationInfo(myDebugProcess, evaluationContext, it)
         }.map {
-          val element = it.first
-          val isAddition = it.second.value()
-          val descriptor = ModificationInfoDescriptor(myDebugSession.project, element, isAddition)
-          myNodeManager.createNode(descriptor, evaluationContext)
-        }
+        val element = it.first
+        val isAddition = it.second.value()
+        val descriptor = ModificationInfoDescriptor(myDebugSession.project, element, isAddition)
+        myNodeManager.createNode(descriptor, evaluationContext)
+      }
 
       builder.setChildren(nodes)
     }
@@ -253,8 +251,8 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
       setupFieldHistoryTree()
       loadFieldHistory()
       myComponent = JBSplitter(false, SPLITTER_PROPORTION)
-      myComponent.firstComponent = myFieldHistory
-      myComponent.secondComponent = myStackFrameList
+      myComponent.firstComponent = JBScrollPane(myFieldHistory)
+      myComponent.secondComponent = JBScrollPane(myStackFrameList)
     }
 
     fun loadHistory(fieldParentNode: XValueNodeImpl) {
@@ -317,9 +315,6 @@ class CollectionHistoryView(private val myFieldParentClsName: String,
 
     private fun tryGetJVMClsName(vm: VirtualMachineProxyImpl): String? {
       DebuggerManagerThreadImpl.assertIsManagerThread()
-      val fieldParentRef = getObjectReferenceForNode(myCollectionNode?.parent as? XValueNodeImpl)
-      val fieldParentJVMClsName = fieldParentRef?.referenceType()?.name()
-      if (fieldParentJVMClsName != null) return fieldParentJVMClsName
       if (myFieldParentJVMClsName != null) return myFieldParentJVMClsName
       return vm.allClasses().firstOrNull {
         jvmClsNameToJavaClsName(it.name()) == myFieldParentClsName

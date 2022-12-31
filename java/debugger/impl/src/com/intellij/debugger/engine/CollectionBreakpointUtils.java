@@ -6,7 +6,6 @@ import com.intellij.debugger.engine.evaluation.EvaluationContext;
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl;
 import com.intellij.debugger.engine.requests.RequestManagerImpl;
 import com.intellij.debugger.impl.DebuggerUtilsEx;
-import com.intellij.debugger.impl.DebuggerUtilsImpl;
 import com.intellij.debugger.jdi.*;
 import com.intellij.debugger.memory.utils.StackFrameItem;
 import com.intellij.debugger.requests.ClassPrepareRequestor;
@@ -37,21 +36,23 @@ public final class CollectionBreakpointUtils {
   private static final String INSTRUMENTOR_CLS_NAME = "com.intellij.rt.debugger.agent.CollectionBreakpointInstrumentor";
   private static final String STORAGE_CLASS_NAME = "com.intellij.rt.debugger.agent.CollectionBreakpointStorage";
 
-  private static final String PAIR_CLS_NAME = INSTRUMENTOR_CLS_NAME + "$Pair";
+  private static final String ENTRY_CLS_NAME = "com.intellij.rt.debugger.agent.util.Entry";
 
   private static final String COLLECTION_MODIFICATION_INFO_CLASS_NAME = STORAGE_CLASS_NAME + "$" + "CollectionModificationInfo";
 
   private static final String ENABLE_DEBUG_MODE_FIELD = "DEBUG";
-  private static final String ENABLE_HISTORY_SAVING_FIELD = "ENABLED";
+
+  private static final String ENABLE_HISTORY_SAVING_METHOD_NAME = "setSavingHistoryForFieldEnabled";
+  private static final String ENABLE_HISTORY_SAVING_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;Z)V";
 
   private static final String EMULATE_FIELD_WATCHPOINT_METHOD_NAME = "emulateFieldWatchpoint";
-  private static final String EMULATE_FIELD_WATCHPOINT_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
+  private static final String EMULATE_FIELD_WATCHPOINT_METHOD_DESC = "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V";
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_NAME = "captureFieldModification";
   private static final String CAPTURE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
   private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME = "transformCollectionAndSaveFieldModification";
   private static final String TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Z)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
-  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;Ljava/lang/Object;)V";
+  private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC = "(Lcom/intellij/rt/debugger/agent/util/Multiset;Ljava/lang/Object;)V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_NAME = "captureCollectionModification";
   private static final String CAPTURE_COLLECTION_MODIFICATION_SPECIAL_METHOD_DESC = "(ZZLjava/lang/Object;Ljava/lang/Object;Z)V";
   private static final String ON_CAPTURE_END_METHOD_NAME = "onCaptureEnd";
@@ -73,13 +74,13 @@ public final class CollectionBreakpointUtils {
   private static final String GET_VALUE_METHOD_NAME = "getValue";
   private static final String GET_VALUE_METHOD_DESC = "()" + OBJECT_TYPE;
 
-  public static void setupCollectionBreakpointAgent(DebugProcessImpl debugProcess) {
+  public static void setupCollectionBreakpointAgent(@NotNull DebugProcessImpl debugProcess) {
     if (Registry.is("debugger.collection.breakpoint.agent.debug")) {
       enableDebugMode(debugProcess);
     }
   }
 
-  private static void enableDebugMode(DebugProcessImpl debugProcess) {
+  private static void enableDebugMode(@NotNull DebugProcessImpl debugProcess) {
     try {
       setClassBooleanField(debugProcess, INSTRUMENTOR_CLS_NAME, ENABLE_DEBUG_MODE_FIELD, true);
     }
@@ -88,17 +89,27 @@ public final class CollectionBreakpointUtils {
     }
   }
 
-  public static void setCollectionHistorySavingEnabled(DebugProcessImpl debugProcess, boolean enabled) {
-    try {
-      setClassBooleanField(debugProcess, STORAGE_CLASS_NAME, ENABLE_HISTORY_SAVING_FIELD, enabled);
-    }
-    catch (Exception e) {
-      LOG.warn("Error setting collection history saving enabled", e);
-    }
+  public static void setCollectionHistorySavingEnabled(@NotNull SuspendContextImpl context,
+                                                       @NotNull String fieldOwnerClsName,
+                                                       @NotNull String fieldName,
+                                                       boolean enabled) {
+    DebuggerManagerThreadImpl.assertIsManagerThread();
+    VirtualMachineProxyImpl vm = context.getDebugProcess().getVirtualMachineProxy();
+
+    Value fieldOwnerClsNameRef = vm.mirrorOf(fieldOwnerClsName);
+    Value fieldNameRef = vm.mirrorOf(fieldName);
+    Value enabledRef = vm.mirrorOf(enabled);
+
+    invokeStorageMethod(context,
+                        ENABLE_HISTORY_SAVING_METHOD_NAME,
+                        ENABLE_HISTORY_SAVING_METHOD_DESC,
+                        toList(fieldOwnerClsNameRef, fieldNameRef, enabledRef));
   }
 
-  private static void setClassBooleanField(DebugProcessImpl debugProcess, String clsName, String fieldName, boolean value)
-    throws EvaluateException {
+  private static void setClassBooleanField(@NotNull DebugProcessImpl debugProcess,
+                                           @NotNull String clsName,
+                                           @NotNull String fieldName,
+                                           boolean value) throws EvaluateException {
     final RequestManagerImpl requestsManager = debugProcess.getRequestsManager();
     ClassPrepareRequestor requestor = new ClassPrepareRequestor() {
       @Override
@@ -106,6 +117,10 @@ public final class CollectionBreakpointUtils {
         try {
           requestsManager.deleteRequest(this);
           Field field = referenceType.fieldByName(fieldName);
+          if (field == null) {
+            LOG.warn("Can't find field " + fieldName + " of class " + clsName);
+            return;
+          }
           Value trueValue = debugProcess.getVirtualMachineProxy().mirrorOf(value);
           ((ClassType)referenceType).setValue(field, trueValue);
         }
@@ -123,28 +138,21 @@ public final class CollectionBreakpointUtils {
     }
   }
 
-  private static VirtualMachineProxyImpl getVirtualMachine(SuspendContextImpl context) {
-    StackFrameProxyImpl frameProxy = context.getFrameProxy();
-    return frameProxy != null ? frameProxy.getVirtualMachine() : null;
-  }
-
   @NotNull
-  public static List<Value> getFieldModificationsHistory(SuspendContextImpl context,
-                                                         String fieldName,
-                                                         String clsName,
+  public static List<Value> getFieldModificationsHistory(@NotNull SuspendContextImpl context,
+                                                         @NotNull String fieldName,
+                                                         @NotNull String fieldOwnerClsName,
                                                          @Nullable Value clsInstance) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl vm = getVirtualMachine(context);
-    if (vm == null) {
-      return Collections.emptyList();
-    }
+    VirtualMachineProxyImpl vm = context.getDebugProcess().getVirtualMachineProxy();
 
-    Value clsNameRef = vm.mirrorOf(clsName);
+    Value fieldOwnerClsNameRef = vm.mirrorOf(fieldOwnerClsName);
     Value fieldNameRef = vm.mirrorOf(fieldName);
 
-    Value result =
-      invokeStorageMethod(context, GET_FIELD_MODIFICATIONS_METHOD_NAME, GET_FIELD_MODIFICATIONS_METHOD_DESC,
-                          toList(clsNameRef, fieldNameRef, clsInstance));
+    Value result = invokeStorageMethod(context,
+                                       GET_FIELD_MODIFICATIONS_METHOD_NAME,
+                                       GET_FIELD_MODIFICATIONS_METHOD_DESC,
+                                       toList(fieldOwnerClsNameRef, fieldNameRef, clsInstance));
 
     if (result instanceof ArrayReference) {
       return ((ArrayReference)result).getValues();
@@ -154,31 +162,31 @@ public final class CollectionBreakpointUtils {
   }
 
   @NotNull
-  public static List<StackFrameItem> getFieldModificationStack(SuspendContextImpl context,
-                                                               String fieldName,
-                                                               String clsName,
-                                                               @Nullable Value collectionInstance,
-                                                               IntegerValue modificationIndex) {
+  public static List<StackFrameItem> getFieldModificationStack(@NotNull SuspendContextImpl context,
+                                                               @NotNull String fieldName,
+                                                               @NotNull String fieldOwnerClsName,
+                                                               @Nullable Value clsInstance,
+                                                               @NotNull IntegerValue modificationIndex) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl vm = getVirtualMachine(context);
-    if (vm == null) {
-      return Collections.emptyList();
-    }
+    VirtualMachineProxyImpl vm = context.getDebugProcess().getVirtualMachineProxy();
 
-    Value clsNameRef = vm.mirrorOf(clsName);
+    Value fieldOwnerClsNameRef = vm.mirrorOf(fieldOwnerClsName);
     Value fieldNameRef = vm.mirrorOf(fieldName);
 
-    Value result = invokeStorageMethod(context, GET_FIELD_STACK_METHOD_NAME, GET_FIELD_STACK_METHOD_DESC,
-                                       toList(clsNameRef, fieldNameRef, collectionInstance, modificationIndex));
+    Value result = invokeStorageMethod(
+      context, GET_FIELD_STACK_METHOD_NAME, GET_FIELD_STACK_METHOD_DESC,
+      toList(fieldOwnerClsNameRef, fieldNameRef, clsInstance, modificationIndex)
+    );
 
     String message = result instanceof StringReference ? ((StringReference)result).value() : "";
 
     return readStackItems(context.getDebugProcess(), message, vm);
   }
 
-  private static List<StackFrameItem> readStackItems(DebugProcessImpl debugProcess,
-                                                     String message,
-                                                     VirtualMachineProxyImpl vm) {
+  @NotNull
+  private static List<StackFrameItem> readStackItems(@NotNull DebugProcessImpl debugProcess,
+                                                     @NotNull String message,
+                                                     @NotNull VirtualMachineProxyImpl vm) {
     List<StackFrameItem> items = new ArrayList<>();
     ClassesByNameProvider classesByName = ClassesByNameProvider.createCache(vm.allClasses());
     try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(message.getBytes(StandardCharsets.ISO_8859_1)))) {
@@ -192,13 +200,13 @@ public final class CollectionBreakpointUtils {
       }
     }
     catch (Exception e) {
-      DebuggerUtilsImpl.logError(e);
+      LOG.warn(e);
     }
     return items;
   }
 
   @NotNull
-  private static Location findLocation(DebugProcessImpl debugProcess,
+  private static Location findLocation(@NotNull DebugProcessImpl debugProcess,
                                        @NotNull ClassesByNameProvider classesByName,
                                        @NotNull String className,
                                        @NotNull String methodName,
@@ -219,17 +227,12 @@ public final class CollectionBreakpointUtils {
   }
 
   @NotNull
-  public static List<Value> getCollectionModificationsHistory(SuspendContextImpl context, Value collectionInstance) {
+  public static List<Value> getCollectionModificationsHistory(@NotNull SuspendContextImpl context, @NotNull Value collectionInstance) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl vm = getVirtualMachine(context);
-    if (vm == null) {
-      return Collections.emptyList();
-    }
-
-    Value collectionModifications = invokeStorageMethod(context, GET_COLLECTION_MODIFICATIONS_METHOD_NAME,
+    Value collectionModifications = invokeStorageMethod(context,
+                                                        GET_COLLECTION_MODIFICATIONS_METHOD_NAME,
                                                         GET_COLLECTION_MODIFICATIONS_METHOD_DESC,
                                                         Collections.singletonList(collectionInstance));
-
     if (collectionModifications instanceof ArrayReference) {
       return ((ArrayReference)collectionModifications).getValues();
     }
@@ -237,24 +240,24 @@ public final class CollectionBreakpointUtils {
     return Collections.emptyList();
   }
 
-  public static List<StackFrameItem> getCollectionModificationStack(SuspendContextImpl context,
+  @NotNull
+  public static List<StackFrameItem> getCollectionModificationStack(@NotNull SuspendContextImpl context,
                                                                     @Nullable Value collectionInstance,
-                                                                    IntegerValue modificationIndex) {
+                                                                    @NotNull IntegerValue modificationIndex) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    VirtualMachineProxyImpl vm = getVirtualMachine(context);
-    if (vm == null) {
-      return Collections.emptyList();
-    }
+    VirtualMachineProxyImpl vm = context.getDebugProcess().getVirtualMachineProxy();
 
-    Value result =
-      invokeStorageMethod(context, GET_COLLECTION_STACK_METHOD_NAME, GET_COLLECTION_STACK_METHOD_DESC,
-                          toList(collectionInstance, modificationIndex));
+    Value result = invokeStorageMethod(context,
+                                       GET_COLLECTION_STACK_METHOD_NAME,
+                                       GET_COLLECTION_STACK_METHOD_DESC,
+                                       toList(collectionInstance, modificationIndex));
 
     String message = result instanceof StringReference ? ((StringReference)result).value() : "";
 
     return readStackItems(context.getDebugProcess(), message, vm);
   }
 
+  @NotNull
   private static List<Value> toList(Value... elements) {
     List<Value> list = new ArrayList<>();
     Collections.addAll(list, elements);
@@ -262,9 +265,9 @@ public final class CollectionBreakpointUtils {
   }
 
   @Nullable
-  public static Pair<ObjectReference, BooleanValue> getCollectionModificationInfo(DebugProcessImpl debugProcess,
-                                                                                  EvaluationContext evaluationContext,
-                                                                                  ObjectReference collectionInstance) {
+  public static Pair<ObjectReference, BooleanValue> getCollectionModificationInfo(@NotNull DebugProcessImpl debugProcess,
+                                                                                  @NotNull EvaluationContext evaluationContext,
+                                                                                  @NotNull ObjectReference collectionInstance) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
     ClassType cls = getClass(debugProcess, evaluationContext, COLLECTION_MODIFICATION_INFO_CLASS_NAME);
     if (cls != null) {
@@ -283,18 +286,18 @@ public final class CollectionBreakpointUtils {
         }
       }
       catch (EvaluateException e) {
-        DebuggerUtilsImpl.logError(e);
+        LOG.warn(e);
       }
     }
     return null;
   }
 
   @Nullable
-  public static Pair<Value, Value> getKeyAndValue(DebugProcessImpl debugProcess,
-                                                  EvaluationContext evaluationContext,
-                                                  ObjectReference mapEntryRef) {
+  public static Pair<Value, Value> getKeyAndValue(@NotNull DebugProcessImpl debugProcess,
+                                                  @NotNull EvaluationContext evaluationContext,
+                                                  @NotNull ObjectReference mapEntryRef) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
-    ClassType cls = getClass(debugProcess, evaluationContext, PAIR_CLS_NAME);
+    ClassType cls = getClass(debugProcess, evaluationContext, ENTRY_CLS_NAME);
     if (cls != null) {
       Method getKeyMethod = DebuggerUtils.findMethod(cls, GET_KEY_METHOD_NAME, GET_KEY_METHOD_DESC);
       Method getValueMethod = DebuggerUtils.findMethod(cls, GET_VALUE_METHOD_NAME, GET_VALUE_METHOD_DESC);
@@ -309,17 +312,17 @@ public final class CollectionBreakpointUtils {
         }
       }
       catch (EvaluateException e) {
-        DebuggerUtilsImpl.logError(e);
+        LOG.warn(e);
       }
     }
     return null;
   }
 
-  public static void captureFieldModification(SuspendContextImpl context,
-                                              String fieldOwnerClsName,
-                                              String fieldName,
-                                              Value valueToBe,
-                                              ObjectReference fieldOwnerInstance,
+  public static void captureFieldModification(@NotNull SuspendContextImpl context,
+                                              @NotNull String fieldOwnerClsName,
+                                              @NotNull String fieldName,
+                                              @Nullable Value valueToBe,
+                                              @Nullable ObjectReference fieldOwnerInstance,
                                               boolean shouldSaveStack) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
     StackFrameProxyImpl frameProxy = context.getFrameProxy();
@@ -338,14 +341,17 @@ public final class CollectionBreakpointUtils {
     args.add(fieldNameRef);
     args.add(shouldSaveStackRef);
 
-    invokeInstrumentorMethod(context, TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME,
-                             TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC, args);
+    invokeInstrumentorMethod(context,
+                             TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_NAME,
+                             TRANSFORM_COLLECTION_AND_SAVE_FIELD_MODIFICATION_METHOD_DESC,
+                             args);
   }
 
-  public static void emulateFieldWatchpoint(SuspendContextImpl context,
-                                            String fieldOwnerClsName,
-                                            String fieldName,
-                                            Set<String> unprocessedClasses) {
+  public static void emulateFieldWatchpoint(@NotNull SuspendContextImpl context,
+                                            @NotNull String fieldOwnerClsName,
+                                            @NotNull String fieldName,
+                                            @NotNull String fieldDescriptor,
+                                            @NotNull Set<String> unprocessedClasses) {
     StackFrameProxyImpl frameProxy = context.getFrameProxy();
     if (frameProxy == null) {
       return;
@@ -353,12 +359,14 @@ public final class CollectionBreakpointUtils {
 
     Value fieldOwnerClsNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldOwnerClsName);
     Value fieldNameRef = frameProxy.getVirtualMachine().mirrorOf(fieldName);
+    Value fieldTypeSigRef = frameProxy.getVirtualMachine().mirrorOf(fieldDescriptor);
 
     List<Value> clsNamesRef = ContainerUtil.map(unprocessedClasses, clsName -> frameProxy.getVirtualMachine().mirrorOf(clsName));
 
     List<Value> args = new ArrayList<>();
     args.add(fieldOwnerClsNameRef);
     args.add(fieldNameRef);
+    args.add(fieldTypeSigRef);
     args.addAll(clsNamesRef);
 
     invokeInstrumentorMethod(context,
@@ -367,7 +375,11 @@ public final class CollectionBreakpointUtils {
                              args);
   }
 
-  private static @Nullable Location findLocationInMethod(ClassType instrumentorCls, String methodName, String methodDesc, int lineNumber) {
+  @Nullable
+  private static Location findLocationInMethod(@NotNull ClassType instrumentorCls,
+                                               @NotNull String methodName,
+                                               @NotNull String methodDesc,
+                                               int lineNumber) {
     try {
       Method method = DebuggerUtils.findMethod(instrumentorCls, methodName, methodDesc);
       if (method != null) {
@@ -378,12 +390,12 @@ public final class CollectionBreakpointUtils {
       }
     }
     catch (AbsentInformationException e) {
-      DebuggerUtilsImpl.logError(e);
+      LOG.warn(e);
     }
     return null;
   }
 
-  private static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(ClassType instrumentorCls) {
+  private static @NotNull List<@Nullable Location> findLocationsInCollectionModificationsTrackers(@NotNull ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
     locations.add(findLocationInMethod(instrumentorCls, CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
                                        CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC, 5));
@@ -394,45 +406,51 @@ public final class CollectionBreakpointUtils {
     return locations;
   }
 
-  private static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(ClassType instrumentorCls) {
+  private static @NotNull List<@Nullable Location> findLocationsInFieldModificationsTrackers(@NotNull ClassType instrumentorCls) {
     List<Location> locations = new ArrayList<>();
     locations.add(findLocationInMethod(instrumentorCls, CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
                                        CAPTURE_FIELD_MODIFICATION_METHOD_DESC, 3));
     return locations;
   }
 
-  public static @NotNull List<Location> findLocationsForLineBreakpoints(SuspendContextImpl context,
-                                                                        boolean fieldWatchpointIsEmulated) {
-    DebugProcessImpl debugProcess = context.getDebugProcess();
-    EvaluationContextImpl evalContext = new EvaluationContextImpl(context, context.getFrameProxy());
-    evalContext = evalContext.withAutoLoadClasses(false);
-    ClassType instrumentorCls = getInstrumentorClass(debugProcess, evalContext);
+  @NotNull
+  public static List<Location> findLocationsForLineBreakpoints(@NotNull DebugProcessImpl debugProcess,
+                                                               boolean fieldWatchpointIsEmulated) {
+
+    ClassType instrumentorCls = getInstrumentorClass(debugProcess, null);
+    if (instrumentorCls == null) {
+      LOG.warn("can't find instrumentor class");
+      return Collections.emptyList();
+    }
     List<@Nullable Location> locations = findLocationsInCollectionModificationsTrackers(instrumentorCls);
     if (fieldWatchpointIsEmulated) {
       locations.addAll(findLocationsInFieldModificationsTrackers(instrumentorCls));
     }
     if (locations.contains(null)) {
-      DebuggerUtilsImpl.logError(new RuntimeException("can't find locations for line breakpoints in instrumentor methods"));
+      LOG.warn("can't find locations for line breakpoints in instrumentor methods");
       return Collections.emptyList();
     }
     return locations;
   }
 
-  public static Value invokeInstrumentorMethod(SuspendContextImpl context,
-                                               String methodName,
-                                               String methodDesc,
-                                               List<Value> args) {
+  public static Value invokeInstrumentorMethod(@NotNull SuspendContextImpl context,
+                                               @NotNull String methodName,
+                                               @NotNull String methodDesc,
+                                               @NotNull List<Value> args) {
     return invokeMethod(context, INSTRUMENTOR_CLS_NAME, methodName, methodDesc, args);
   }
 
-  public static Value invokeStorageMethod(SuspendContextImpl context,
-                                          String methodName,
-                                          String methodDesc,
-                                          List<Value> args) {
+  public static Value invokeStorageMethod(@NotNull SuspendContextImpl context,
+                                          @NotNull String methodName,
+                                          @NotNull String methodDesc,
+                                          @NotNull List<Value> args) {
     return invokeMethod(context, STORAGE_CLASS_NAME, methodName, methodDesc, args);
   }
 
-  private static ClassType getClass(DebugProcessImpl debugProcess, @Nullable EvaluationContext evalContext, String clsName) {
+  @Nullable
+  private static ClassType getClass(@NotNull DebugProcessImpl debugProcess,
+                                    @Nullable EvaluationContext evalContext,
+                                    @NotNull String clsName) {
     try {
       return (ClassType)debugProcess.findClass(evalContext, clsName, null);
     }
@@ -441,21 +459,24 @@ public final class CollectionBreakpointUtils {
     }
   }
 
-  public static ClassType getInstrumentorClass(DebugProcessImpl debugProcess, @Nullable EvaluationContextImpl evalContext) {
+  @Nullable
+  public static ClassType getInstrumentorClass(@NotNull DebugProcessImpl debugProcess, @Nullable EvaluationContextImpl evalContext) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
     return getClass(debugProcess, evalContext, INSTRUMENTOR_CLS_NAME);
   }
 
-  public static ClassType getStorageClass(DebugProcessImpl debugProcess, @Nullable EvaluationContextImpl evalContext) {
+  @Nullable
+  public static ClassType getStorageClass(@NotNull DebugProcessImpl debugProcess, @Nullable EvaluationContextImpl evalContext) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
     return getClass(debugProcess, evalContext, STORAGE_CLASS_NAME);
   }
 
-  private static Value invokeMethod(SuspendContextImpl context,
-                                    String clsName,
-                                    String methodName,
-                                    String methodDesc,
-                                    List<Value> args) {
+  @Nullable
+  private static Value invokeMethod(@NotNull SuspendContextImpl context,
+                                    @NotNull String clsName,
+                                    @NotNull String methodName,
+                                    @NotNull String methodDesc,
+                                    @NotNull List<Value> args) {
     DebuggerManagerThreadImpl.assertIsManagerThread();
     DebugProcessImpl debugProcess = context.getDebugProcess();
     EvaluationContextImpl evalContext = new EvaluationContextImpl(context, context.getFrameProxy());
@@ -467,11 +488,11 @@ public final class CollectionBreakpointUtils {
       }
       Method method = DebuggerUtils.findMethod(cls, methodName, methodDesc);
       if (method != null) {
-        return debugProcess.invokeMethod(evalContext, cls, method, args);
+        return debugProcess.invokeMethod(evalContext, cls, method, args, true);
       }
     }
     catch (EvaluateException e) {
-      DebuggerUtilsImpl.logError(e);
+      LOG.warn(e);
     }
     return null;
   }

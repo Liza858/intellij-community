@@ -1,7 +1,10 @@
 // Copyright 2000-2022 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
 package com.intellij.rt.debugger.agent;
 
-import com.intellij.rt.debugger.agent.util.CollectionMethodsWrapper;
+import com.intellij.rt.debugger.agent.util.Entry;
+import com.intellij.rt.debugger.agent.util.IdentityWrapper;
+import com.intellij.rt.debugger.agent.util.Multiset;
+import com.intellij.rt.debugger.agent.util.Utils;
 import org.jetbrains.capture.org.objectweb.asm.*;
 import org.jetbrains.capture.org.objectweb.asm.commons.LocalVariablesSorter;
 import org.jetbrains.capture.org.objectweb.asm.tree.*;
@@ -13,22 +16,23 @@ import java.lang.instrument.Instrumentation;
 import java.lang.instrument.UnmodifiableClassException;
 import java.security.ProtectionDomain;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 @SuppressWarnings({"UseOfSystemOutOrSystemErr", "CallToPrintStackTrace", "rawtypes"})
 public class CollectionBreakpointInstrumentor {
-  private static final String OBJECT_TYPE = "Ljava/lang/Object;";
+  private static final String OBJECT_CLS_NAME = "java/lang/Object";
+  private static final String COLLECTION_CLS_NAME = "java/util/Collection";
+  private static final String MAP_CLS_NAME = "java/util/Map";
+  private static final String ABSTRACT_COLLECTION_CLS_NAME = "java/util/AbstractCollection";
+  private static final String ABSTRACT_LIST_CLS_NAME = "java/util/AbstractList";
+  private static final String ARRAY_LIST_CLS_NAME = "java/util/ArrayList";
+
+  private static final String OBJECT_TYPE = "L" + OBJECT_CLS_NAME + ";";
   private static final String STRING_TYPE = "Ljava/lang/String;";
-  private static final String MULTISET_TYPE = "Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Multiset;";
-  private static final String PAIR_TYPE = "Lcom/intellij/rt/debugger/agent/CollectionBreakpointInstrumentor$Pair;";
+  private static final String MULTISET_TYPE = "Lcom/intellij/rt/debugger/agent/util/Multiset;";
+  private static final String ENTRY_TYPE = "Lcom/intellij/rt/debugger/agent/util/Entry;";
   private static final String IDENTITY_MAP_TYPE = "Ljava/util/IdentityHashMap;";
-  private static final String COLLECTION_TYPE = "java/util/Collection";
-  private static final String MAP_TYPE = "java/util/Map";
-  private static final String JAVA_UTIL_PREFIX = "java/util";
-  private static final String ABSTRACT_COLLECTION_TYPE = "java/util/AbstractCollection";
-  private static final String ABSTRACT_LIST_TYPE = "java/util/AbstractList";
-  private static final String ARRAY_LIST_TYPE = "java/util/ArrayList";
+
   private static final String CAPTURE_COLLECTION_MODIFICATION_METHOD_NAME = "captureCollectionModification";
   private static final String CAPTURE_COLLECTION_MODIFICATION_METHOD_DESC = "(" + "Z" + "Z" + OBJECT_TYPE + OBJECT_TYPE + "Z" + ")V";
   private static final String CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME = "captureCollectionModification";
@@ -46,24 +50,21 @@ public class CollectionBreakpointInstrumentor {
   private static final String GET_COPIES_STORAGE_METHOD_NAME = "getCopiesStorage";
   private static final String GET_COPIES_STORAGE_METHOD_DESC = "()" + IDENTITY_MAP_TYPE;
   private static final String CONSTRUCTOR_METHOD_NAME = "<init>";
-  private static final String CREATE_PAIR_METHOD_NAME = "createPair";
-  private static final String CREATE_PAIR_METHOD_DESC = "(" + OBJECT_TYPE + OBJECT_TYPE + ")" + PAIR_TYPE;
-  private static final String COLLECTION_INTERFACE_NAME = "java.util.Collection";
-  private static final String MAP_INTERFACE_NAME = "java.util.Map";
-  private static final String JAVA_UTIL_PACKAGE_NAME = "java.util";
-  private static final String OBJECT_CLASS_NAME = "java.lang.Object";
+  private static final String CREATE_ENTRY_METHOD_NAME = "createEntry";
+  private static final String CREATE_ENTRY_METHOD_DESC = "(" + OBJECT_TYPE + OBJECT_TYPE + ")" + ENTRY_TYPE;
 
-  private static final ConcurrentIdentityHashMap myInstanceFilters = new ConcurrentIdentityHashMap();
+  private static final TrackedCollections myTrackedCollections = new TrackedCollections();
   private static final TrackedFields myTrackedFields = new TrackedFields();
 
   private static final Map<String, KnownMethodsSet> myKnownMethods = new HashMap<String, KnownMethodsSet>();
 
-  private static final Set<String> myUnprocessedNestedMembers = new HashSet<String>();
-  private static final Map<String, KnownMethodsSet> myCollectionsToTransform = new HashMap<String, KnownMethodsSet>();
-
-  private static final Set<String> myNestedCollectionMembers = new HashSet<String>();
+  private static final Set<String> myUnprocessedNestMates = new HashSet<String>();
   private static final Set<String> myProcessedClasses = new HashSet<String>();
-  private static final Set<String> myClassesToTransform = new HashSet<String>();
+
+  private static final Set<String> myFieldOwnersToTransform = new HashSet<String>();
+  private static final Map<String, KnownMethodsSet> myCollectionsToTransform = new HashMap<String, KnownMethodsSet>();
+  private static final Set<String> myCollectionNestMates = new HashSet<String>();
+
   private static final ReentrantLock myTransformLock = new ReentrantLock();
 
   @SuppressWarnings("StaticNonFinalField")
@@ -73,67 +74,74 @@ public class CollectionBreakpointInstrumentor {
 
   static {
     KnownMethodsSet collectionKnownMethods = new KnownMethodsSet();
-    collectionKnownMethods.add(new ImmutableMethod("size()I"));
-    collectionKnownMethods.add(new ImmutableMethod("contains(Ljava/lang/Object;)Z"));
-    collectionKnownMethods.add(new ImmutableMethod("iterator()Ljava/util/Iterator;"));
-    collectionKnownMethods.add(new ImmutableMethod("toArray()[Ljava/lang/Object;"));
-    collectionKnownMethods.add(new ImmutableMethod("toArray([Ljava/lang/Object;)[Ljava/lang/Object;"));
-    collectionKnownMethods.add(new ImmutableMethod("containsAll(Ljava/util/Collection;)Z"));
-    collectionKnownMethods.add(new ImmutableMethod("toArray(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"));
-    collectionKnownMethods.add(new ImmutableMethod("spliterator()Ljava/util/Spliterator;"));
-    collectionKnownMethods.add(new ImmutableMethod("parallelStream()Ljava/util/stream/Stream;"));
-    collectionKnownMethods.add(new ImmutableMethod("equals(Ljava/lang/Object;)Z"));
-    collectionKnownMethods.add(new ImmutableMethod("hashCode()I"));
-    collectionKnownMethods.add(new ReturnsBooleanMethod("add(Ljava/lang/Object;)Z", true));
-    collectionKnownMethods.add(new ReturnsBooleanMethod("remove(Ljava/lang/Object;)Z", false));
-    myKnownMethods.put(COLLECTION_TYPE, collectionKnownMethods);
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "size()I"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "contains(Ljava/lang/Object;)Z"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "iterator()Ljava/util/Iterator;"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "toArray()[Ljava/lang/Object;"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "toArray([Ljava/lang/Object;)[Ljava/lang/Object;"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "containsAll(Ljava/util/Collection;)Z"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "toArray(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "spliterator()Ljava/util/Spliterator;"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "parallelStream()Ljava/util/stream/Stream;"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "equals(Ljava/lang/Object;)Z"));
+    collectionKnownMethods.add(new ImmutableMethod(COLLECTION_CLS_NAME, "hashCode()I"));
+    collectionKnownMethods.add(new ReturnsBooleanMethod(COLLECTION_CLS_NAME, "add(Ljava/lang/Object;)Z", true));
+    collectionKnownMethods.add(new ReturnsBooleanMethod(COLLECTION_CLS_NAME, "remove(Ljava/lang/Object;)Z", false));
+    myKnownMethods.put(COLLECTION_CLS_NAME, collectionKnownMethods);
 
     KnownMethodsSet abstractCollectionKnownMethods = new KnownMethodsSet();
-    abstractCollectionKnownMethods.add(new ImmutableMethod("toString()Ljava/lang/String;"));
-    myKnownMethods.put(ABSTRACT_COLLECTION_TYPE, abstractCollectionKnownMethods);
+    abstractCollectionKnownMethods.add(new ImmutableMethod(ABSTRACT_COLLECTION_CLS_NAME, "toString()Ljava/lang/String;"));
+    myKnownMethods.put(ABSTRACT_COLLECTION_CLS_NAME, abstractCollectionKnownMethods);
 
     KnownMethodsSet abstractListKnownMethods = new KnownMethodsSet();
-    abstractListKnownMethods.add(new ImmutableMethod("indexOf(Ljava/lang/Object;)I"));
-    abstractListKnownMethods.add(new ImmutableMethod("lastIndexOf(Ljava/lang/Object;)I"));
-    abstractListKnownMethods.add(new ImmutableMethod("listIterator()Ljava/util/ListIterator;"));
-    abstractListKnownMethods.add(new ImmutableMethod("listIterator(I)Ljava/util/ListIterator;"));
-    abstractListKnownMethods.add(new ImmutableMethod("subList(II)Ljava/util/List;"));
-    myKnownMethods.put(ABSTRACT_LIST_TYPE, abstractListKnownMethods);
+    abstractListKnownMethods.add(new ImmutableMethod(ABSTRACT_LIST_CLS_NAME, "indexOf(Ljava/lang/Object;)I"));
+    abstractListKnownMethods.add(new ImmutableMethod(ABSTRACT_LIST_CLS_NAME, "lastIndexOf(Ljava/lang/Object;)I"));
+    abstractListKnownMethods.add(new ImmutableMethod(ABSTRACT_LIST_CLS_NAME, "listIterator()Ljava/util/ListIterator;"));
+    abstractListKnownMethods.add(new ImmutableMethod(ABSTRACT_LIST_CLS_NAME, "listIterator(I)Ljava/util/ListIterator;"));
+    abstractListKnownMethods.add(new ImmutableMethod(ABSTRACT_LIST_CLS_NAME, "subList(II)Ljava/util/List;"));
+    myKnownMethods.put(ABSTRACT_LIST_CLS_NAME, abstractListKnownMethods);
 
     KnownMethodsSet arrayListKnownMethods = new KnownMethodsSet();
-    arrayListKnownMethods.add(new ImmutableMethod("indexOfRange(Ljava/lang/Object;II)I"));
-    arrayListKnownMethods.add(new ImmutableMethod("lastIndexOfRange(Ljava/lang/Object;II)I"));
-    arrayListKnownMethods.add(new ImmutableMethod("clone()Ljava/lang/Object;"));
-    arrayListKnownMethods.add(new ImmutableMethod("equalsRange(Ljava/util/List;II)Z"));
-    arrayListKnownMethods.add(new ImmutableMethod("equalsArrayList(Ljava/util/ArrayList;)Z"));
-    arrayListKnownMethods.add(new ImmutableMethod("hashCodeRange(II)I"));
-    arrayListKnownMethods.add(new ImmutableMethod("outOfBoundsMsg(I)Ljava/lang/String;"));
-    //arrayListKnownMethods.add(new AddAllMethod());
-    //arrayListKnownMethods.add(new RemoveAllMethod());
-    myKnownMethods.put(ARRAY_LIST_TYPE, arrayListKnownMethods);
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "indexOfRange(Ljava/lang/Object;II)I"));
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "lastIndexOfRange(Ljava/lang/Object;II)I"));
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "clone()Ljava/lang/Object;"));
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "equalsRange(Ljava/util/List;II)Z"));
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "equalsArrayList(Ljava/util/ArrayList;)Z"));
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "hashCodeRange(II)I"));
+    arrayListKnownMethods.add(new ImmutableMethod(ARRAY_LIST_CLS_NAME, "outOfBoundsMsg(I)Ljava/lang/String;"));
+    arrayListKnownMethods.add(new AddAllMethod(ARRAY_LIST_CLS_NAME));
+    arrayListKnownMethods.add(new RemoveAllMethod(ARRAY_LIST_CLS_NAME));
+    myKnownMethods.put(ARRAY_LIST_CLS_NAME, arrayListKnownMethods);
 
     KnownMethodsSet mapKnownMethods = new KnownMethodsSet();
-    mapKnownMethods.add(new ImmutableMethod("size()I"));
-    mapKnownMethods.add(new ImmutableMethod("isEmpty()Z"));
-    mapKnownMethods.add(new ImmutableMethod("keySet()Ljava/util/Set;"));
-    mapKnownMethods.add(new ImmutableMethod("values()Ljava/util/Collection;"));
-    mapKnownMethods.add(new ImmutableMethod("entrySet()Ljava/util/Set;"));
-    mapKnownMethods.add(new ImmutableMethod("containsKey(Ljava/lang/Object;)Z"));
-    mapKnownMethods.add(new ImmutableMethod("containsValue(Ljava/lang/Object;)Z"));
-    mapKnownMethods.add(new ImmutableMethod("equals(Ljava/lang/Object;)Z"));
-    mapKnownMethods.add(new ImmutableMethod("hashCode()I"));
-    mapKnownMethods.add(new PutMethod());
-    mapKnownMethods.add(new RemoveKeyMethod());
-    myKnownMethods.put(MAP_TYPE, mapKnownMethods);
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "size()I"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "isEmpty()Z"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "keySet()Ljava/util/Set;"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "values()Ljava/util/Collection;"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "entrySet()Ljava/util/Set;"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "containsKey(Ljava/lang/Object;)Z"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "containsValue(Ljava/lang/Object;)Z"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "equals(Ljava/lang/Object;)Z"));
+    mapKnownMethods.add(new ImmutableMethod(MAP_CLS_NAME, "hashCode()I"));
+    mapKnownMethods.add(new PutMethod(MAP_CLS_NAME));
+    mapKnownMethods.add(new RemoveKeyMethod(MAP_CLS_NAME));
+    myKnownMethods.put(MAP_CLS_NAME, mapKnownMethods);
   }
 
   public static void init(Instrumentation instrumentation) {
     ourInstrumentation = instrumentation;
     ourInstrumentation.addTransformer(new CollectionBreakpointTransformer(), true);
 
+    CollectionBreakpointStorage.init(); // just for class loading
+
     if (DEBUG) {
       System.out.println("Collection breakpoint instrumentor: ready");
     }
+  }
+
+  private static void handleException(Throwable e) {
+    System.err.println("Critical error in IDEA CollectionBreakpoint instrumenting agent. Please report to IDEA support:");
+    e.printStackTrace();
   }
 
   private static void processFailedToInstrumentError(String className, Exception error) {
@@ -157,165 +165,9 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  @SuppressWarnings("unused")
-  public static void captureCollectionModification(boolean shouldCapture,
-                                                   boolean modified,
-                                                   Object collectionInstance,
-                                                   Object elem,
-                                                   boolean isAddition) {
-    try {
-      if (!shouldCapture || !modified) {
-        return;
-      }
-      CollectionBreakpointStorage.saveCollectionModification(collectionInstance, elem, isAddition);
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-  }
+  //// METHODS CALLED FROM THE USER PROCESS
 
-  @SuppressWarnings("unused")
-  public static void captureCollectionModification(Multiset oldElements,
-                                                   Object collectionInstance) {
-    try {
-      CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
-      if (oldElements == null || lock == null) {
-        return;
-      }
-      ArrayList<Modification> modifications = getModifications(oldElements, collectionInstance);
-      if (!modifications.isEmpty()) {
-        saveCollectionModifications(collectionInstance, modifications);
-      }
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-  }
-
-  @SuppressWarnings("unused")
-  public static boolean onCaptureStart(Object collectionInstance, boolean shouldSynchronized) {
-    try {
-      CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
-      if (lock != null) {
-        return lock.lock(shouldSynchronized);
-      }
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-    return false;
-  }
-
-  @SuppressWarnings("unused")
-  public static void onCaptureStart(Object collectionInstance, IdentityHashMap<Object, Multiset> copiesOfCollections) {
-    try {
-      CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
-      if (lock == null) {
-        return;
-      }
-      boolean shouldCapture = lock.getMethodEnterNumber() == 0;
-      if (shouldCapture) {
-        lock.lock(true);
-        Multiset copy = captureCollectionCopy(true, collectionInstance);
-        copiesOfCollections.put(collectionInstance, copy);
-      }
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-  }
-
-  @SuppressWarnings("unused")
-  public static void onCaptureEnd(Object collectionInstance, boolean shouldSynchronized) {
-    try {
-      CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
-      if (lock != null) {
-        lock.unlock(shouldSynchronized);
-      }
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-  }
-
-  @SuppressWarnings("unused")
-  public static void onCaptureEnd(IdentityHashMap<Object, Multiset> copiesOfCollections) {
-    try {
-      for (Map.Entry<Object, Multiset> entry : copiesOfCollections.entrySet()) {
-        Object collectionInstance = entry.getKey();
-        Multiset oldElements = entry.getValue();
-        CollectionInstanceLock lock = myInstanceFilters.get(collectionInstance);
-        if (lock == null || oldElements == null) {
-          continue;
-        }
-        ArrayList<Modification> modifications = getModifications(oldElements, collectionInstance);
-        if (!modifications.isEmpty()) {
-          saveCollectionModifications(collectionInstance, modifications);
-        }
-        lock.unlock(true);
-      }
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-  }
-
-  @SuppressWarnings("unused")
-  public static Multiset captureCollectionCopy(boolean shouldCapture, Object collectionInstance) {
-    try {
-      if (!shouldCapture) {
-        return null;
-      }
-      return Multiset.toMultiset(collectionInstance);
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-    }
-    return null;
-  }
-
-  private static void saveCollectionModifications(Object collectionInstance, ArrayList<Modification> modifications) {
-    Collections.sort(modifications);
-    for (Modification modification : modifications) {
-      CollectionBreakpointStorage.saveCollectionModification(collectionInstance,
-                                                             modification.getElement(),
-                                                             modification.isAddition());
-    }
-  }
-
-  private static ArrayList<Modification> getModifications(Multiset oldElements, Object newCollection) {
-    Multiset newElements = Multiset.toMultiset(newCollection);
-
-    ArrayList<Modification> modifications = new ArrayList<Modification>();
-
-    for (Map.Entry<Object, Integer> entry : newElements.entrySet()) {
-      Integer newNumber = entry.getValue();
-      Integer oldNumber = oldElements.get(entry.getKey());
-      Object element = entry.getKey();
-      if (element instanceof Wrapper) {
-        element = ((Wrapper)element).getValue();
-      }
-      if (!newNumber.equals(oldNumber)) {
-        boolean isAddition = oldNumber == null || newNumber > oldNumber;
-        modifications.add(new Modification(element, isAddition));
-      }
-    }
-
-    for (Map.Entry<Object, Integer> entry : oldElements.entrySet()) {
-      Integer newNumber = newElements.get(entry.getKey());
-      Object element = entry.getKey();
-      if (element instanceof Wrapper) {
-        element = ((Wrapper)element).getValue();
-      }
-      if (newNumber == null) {
-        modifications.add(new Modification(element, false));
-      }
-    }
-
-    return modifications;
-  }
-
-  @SuppressWarnings("unused")
+  @SuppressWarnings("unused") // called from the user process
   public static void captureFieldModification(Object collectionInstance,
                                               Object clsInstance,
                                               String clsName,
@@ -329,11 +181,182 @@ public class CollectionBreakpointInstrumentor {
       transformCollectionAndSaveFieldModification(collectionInstance, clsInstance, fieldOwnerClsName, fieldName, shouldSaveStack);
     }
     catch (Exception e) {
-      e.printStackTrace();
+      handleException(e);
     }
   }
 
-  @SuppressWarnings("unused")
+  @SuppressWarnings("unused") // called from the user process
+  public static void captureCollectionModification(boolean shouldCapture,
+                                                   boolean modified,
+                                                   Object collectionInstance,
+                                                   Object elem,
+                                                   boolean isAddition) {
+    try {
+      if (!shouldCapture || !modified) {
+        return;
+      }
+      CollectionBreakpointStorage.saveCollectionModification(collectionInstance, elem, isAddition);
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static void captureCollectionModification(Multiset oldElements, Object collectionInstance) {
+    try {
+      if (oldElements == null) {
+        return;
+      }
+      Multiset newElements = Utils.multisetFromCollection(collectionInstance);
+      ArrayList<Modification> modifications = getModifications(oldElements, newElements);
+      if (!modifications.isEmpty()) {
+        saveCollectionModifications(collectionInstance, modifications);
+      }
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static boolean onCaptureStart(Object collectionInstance, boolean shouldSynchronized) {
+    try {
+      CollectionInstanceLock lock = myTrackedCollections.get(collectionInstance);
+      if (lock != null) {
+        return lock.lock(shouldSynchronized);
+      }
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+    return false;
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static void onCaptureStart(Object collectionInstance, IdentityHashMap<Object, Multiset> copiesOfCollections) {
+    try {
+      CollectionInstanceLock lock = myTrackedCollections.get(collectionInstance);
+      if (lock == null) {
+        return;
+      }
+      boolean shouldCapture = lock.getMethodEnterNumber() == 0;
+      if (shouldCapture) {
+        lock.lock(true);
+        Multiset copy = captureCollectionCopy(true, collectionInstance);
+        copiesOfCollections.put(collectionInstance, copy);
+      }
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static void onCaptureEnd(Object collectionInstance, boolean shouldSynchronized) {
+    try {
+      CollectionInstanceLock lock = myTrackedCollections.get(collectionInstance);
+      if (lock != null) {
+        lock.unlock(shouldSynchronized);
+      }
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static void onCaptureEnd(IdentityHashMap<Object, Multiset> copiesOfCollections) {
+    try {
+      for (Map.Entry<Object, Multiset> entry : copiesOfCollections.entrySet()) {
+        Object collectionInstance = entry.getKey();
+        Multiset oldElements = entry.getValue();
+        CollectionInstanceLock lock = myTrackedCollections.get(collectionInstance);
+        if (lock == null || oldElements == null) {
+          continue;
+        }
+        ArrayList<Modification> modifications = getModifications(oldElements, Utils.multisetFromCollection(collectionInstance));
+        if (!modifications.isEmpty()) {
+          saveCollectionModifications(collectionInstance, modifications);
+        }
+        lock.unlock(true);
+      }
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static Multiset captureCollectionCopy(boolean shouldCapture, Object collectionInstance) {
+    try {
+      if (!shouldCapture) {
+        return null;
+      }
+      return Utils.multisetFromCollection(collectionInstance);
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+    return null;
+  }
+
+  @SuppressWarnings("unused") // called from the user process
+  public static IdentityHashMap<Object, Multiset> getCopiesStorage() {
+    try {
+      return new IdentityHashMap<Object, Multiset>();
+    }
+    catch (Exception e) {
+      handleException(e);
+    }
+    return null;
+  }
+
+  //// END - METHODS CALLED FROM THE USER PROCESS
+
+  private static void addCollectionToTracked(Object collectionInstance) {
+    myTrackedCollections.add(collectionInstance);
+  }
+
+  private static void saveCollectionModifications(Object collectionInstance, ArrayList<Modification> modifications) {
+    Collections.sort(modifications);
+    for (Modification modification : modifications) {
+      CollectionBreakpointStorage.saveCollectionModification(collectionInstance,
+                                                             modification.getElement(),
+                                                             modification.isAddition());
+    }
+  }
+
+  private static ArrayList<Modification> getModifications(Multiset oldElements, Multiset newElements) {
+    ArrayList<Modification> modifications = new ArrayList<Modification>();
+
+    for (Map.Entry<Object, Integer> entry : newElements.entrySet()) {
+      Object element = entry.getKey();
+      Integer newNumber = entry.getValue();
+      Integer oldNumber = oldElements.get(element);
+      if (element instanceof IdentityWrapper) {
+        element = ((IdentityWrapper)element).getObject();
+      }
+      if (!newNumber.equals(oldNumber)) {
+        boolean isAddition = oldNumber == null || newNumber > oldNumber;
+        modifications.add(new Modification(element, isAddition));
+      }
+    }
+
+    for (Map.Entry<Object, Integer> entry : oldElements.entrySet()) {
+      Object element = entry.getKey();
+      Integer newNumber = newElements.get(element);
+      if (element instanceof IdentityWrapper) {
+        element = ((IdentityWrapper)element).getObject();
+      }
+      if (newNumber == null) {
+        modifications.add(new Modification(element, false));
+      }
+    }
+
+    return modifications;
+  }
+
   public static void transformCollectionAndSaveFieldModification(Object collectionInstance,
                                                                  Object clsInstance,
                                                                  String fieldOwnerClsName,
@@ -343,229 +366,225 @@ public class CollectionBreakpointInstrumentor {
       if (collectionInstance == null) {
         return;
       }
-      myInstanceFilters.add(collectionInstance);
+      addCollectionToTracked(collectionInstance);
       transformCollectionClassIfNeeded(collectionInstance.getClass());
       CollectionBreakpointStorage.saveFieldModification(fieldOwnerClsName, fieldName, clsInstance, collectionInstance, shouldSaveStack);
     }
     catch (Exception e) {
-      e.printStackTrace();
+      handleException(e);
     }
   }
 
-  @SuppressWarnings("unused")
-  public static IdentityHashMap<Object, Multiset> getCopiesStorage() {
-    try {
-      return new IdentityHashMap<Object, Multiset>();
-    }
-    catch (Exception e) {
-      e.printStackTrace();
-      return null;
-    }
-  }
-
-  private static void transformClassToCaptureFields(String qualifiedClsName) {
+  private static void transformClassToCaptureFieldModifications(String qualifiedClsName) {
     try {
       myTransformLock.lock();
-      myUnprocessedNestedMembers.clear();
+      myUnprocessedNestMates.clear();
       myProcessedClasses.clear();
       for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
-        String name = cls.getName();
-        if (name.equals(qualifiedClsName)) {
-          try {
-            ourInstrumentation.retransformClasses(cls);
-            myProcessedClasses.add(getInternalClsName(cls));
-          }
-          catch (UnmodifiableClassException e) {
-            e.printStackTrace();
-          }
+        if (qualifiedClsName.equals(cls.getName())) {
+          myFieldOwnersToTransform.add(getInternalClsName(cls));
+          transformClass(cls);
         }
       }
-      transformClassNestedMembers();
+      transformFieldOwnerClsNestMates();
     }
     finally {
       myTransformLock.unlock();
     }
   }
 
-  private static void putFieldToTrackedIfNeeded(String fieldOwnerClsName, String fieldName, Class<?> cls) {
+  private static boolean resolve(Class<?> cls, String fieldOwnerClsName, String fieldName) {
     Class<?> currentCls = cls;
-    while (!fieldOwnerClsName.equals(currentCls.getName()) &&
-           !OBJECT_CLASS_NAME.equals(currentCls.getName())) {
+    do {
       try {
         currentCls.getDeclaredField(fieldName);
-        return;
+        break;
       }
       catch (NoSuchFieldException e) {
         currentCls = currentCls.getSuperclass();
       }
       catch (Exception e) {
-        return;
+        return false;
       }
     }
-    if (fieldOwnerClsName.equals(currentCls.getName())) {
-      myTrackedFields.addField(fieldOwnerClsName, getInternalClsName(cls), fieldName);
+    while (!isObject(currentCls));
+    return fieldOwnerClsName.equals(currentCls.getName());
+  }
+
+  private static void transformFieldOwnerClsNestMates() {
+    processNestMates(myFieldOwnersToTransform);
+  }
+
+  private static void transformCollectionNestMates() {
+    processNestMates(myCollectionNestMates);
+  }
+
+  private static void processNestMates(Set<String> container) {
+    myUnprocessedNestMates.removeAll(myProcessedClasses);
+    while (!myUnprocessedNestMates.isEmpty()) {
+      container.addAll(myUnprocessedNestMates);
+      Set<String> nestMates = new HashSet<String>(myUnprocessedNestMates);
+      myUnprocessedNestMates.clear();
+      transformNestMates(nestMates);
+      myUnprocessedNestMates.removeAll(myProcessedClasses);
     }
   }
 
-  private static void transformClassNestedMembers() {
-    processNestedMembers(myClassesToTransform);
-  }
-
-  private static void transformCollectionNestedMembers() {
-    processNestedMembers(myNestedCollectionMembers);
-  }
-
-  private static void processNestedMembers(Set<String> members) {
-    myUnprocessedNestedMembers.removeAll(myProcessedClasses);
-    while (!myUnprocessedNestedMembers.isEmpty()) {
-      members.addAll(myUnprocessedNestedMembers);
-      Set<String> nestedNames = new HashSet<String>(myUnprocessedNestedMembers);
-      myUnprocessedNestedMembers.clear();
-      transformNestedMembers(nestedNames);
-      myUnprocessedNestedMembers.removeAll(myProcessedClasses);
-    }
-  }
-
-  private static void transformNestedMembers(Set<String> nestedNames) {
+  private static void transformNestMates(Set<String> nestMates) {
     for (Class<?> loadedCls : ourInstrumentation.getAllLoadedClasses()) {
-      String loadedClsName = getInternalClsName(loadedCls);
-      if (nestedNames.contains(loadedClsName)) {
-        try {
-          ourInstrumentation.retransformClasses(loadedCls);
-          myProcessedClasses.add(getInternalClsName(loadedCls));
-        }
-        catch (UnmodifiableClassException e) {
-          e.printStackTrace();
-        }
+      if (nestMates.contains(getInternalClsName(loadedCls))) {
+        transformClass(loadedCls);
       }
     }
   }
 
-  private static List<Class<?>> getSuperClassesAndInterfaces(Class<?> cls) {
+  private static void transformClass(Class<?> cls) {
+    try {
+      myProcessedClasses.add(getInternalClsName(cls));
+      ourInstrumentation.retransformClasses(cls);
+    }
+    catch (UnmodifiableClassException e) {
+      if (DEBUG) {
+        System.out.println("CollectionBreakpoint instrumentor: failed to transform " + cls.getName());
+        e.printStackTrace();
+      }
+    }
+  }
+
+  private static List<Class<?>> getClsAndItsParentsBFS(Class<?> collectionCls) {
     List<Class<?>> result = new ArrayList<Class<?>>();
 
-    Set<String> alreadyProcessed = new HashSet<String>();
-    Queue<Class<?>> supersQueue = new LinkedList<Class<?>>();
-    supersQueue.add(cls);
+    Set<String> processed = new HashSet<String>();
 
-    List<Class<?>> unprocessed = new ArrayList<Class<?>>();
-    while (!supersQueue.isEmpty()) {
-      Class<?> currentCls = supersQueue.poll();
-      alreadyProcessed.add(currentCls.getName());
+    Queue<Class<?>> parentsQueue = new LinkedList<Class<?>>();
+    parentsQueue.add(collectionCls);
+
+    while (!parentsQueue.isEmpty()) {
+      Class<?> currentCls = parentsQueue.poll();
       result.add(currentCls);
+      processed.add(currentCls.getName());
 
-      if (COLLECTION_INTERFACE_NAME.equals(currentCls.getName()) || MAP_INTERFACE_NAME.equals(currentCls.getName())) {
+      if (isTopOfCollectionHierarchy(currentCls)) {
         continue;
       }
 
       Class<?> superCls = currentCls.getSuperclass();
-      if (superCls != null && !OBJECT_CLASS_NAME.equals(superCls.getName()) && !alreadyProcessed.contains(superCls.getName())) {
-        unprocessed.add(superCls);
+      if (superCls != null && !isObject(superCls) && !processed.contains(superCls.getName())) {
+        parentsQueue.add(superCls);
       }
 
       for (Class<?> inter : currentCls.getInterfaces()) {
-        if (JAVA_UTIL_PACKAGE_NAME.equals(inter.getPackage().getName()) &&
-            !alreadyProcessed.contains(inter.getName())) {
-          unprocessed.add(inter);
+        if (isStandardLibraryCls(inter) && !processed.contains(inter.getName())) {
+          parentsQueue.add(inter);
         }
       }
-
-      if (supersQueue.isEmpty()) {
-        supersQueue.addAll(unprocessed);
-        unprocessed.clear();
-      }
     }
 
     return result;
   }
 
-  private static Set<String> getClassesNames(List<Class<?>> classes) {
-    Set<String> result = new HashSet<String>();
-    for (Class<?> cls : classes) {
-      result.add(cls.getName());
-    }
-    return result;
+  private static boolean isTopOfCollectionHierarchy(Class<?> cls) {
+    String clsName = getInternalClsName(cls);
+    return COLLECTION_CLS_NAME.equals(clsName) || MAP_CLS_NAME.equals(clsName);
   }
 
-  private static KnownMethodsSet getAllKnownMethods(Class<?> cls, List<Class<?>> supers) {
-    String internalClsName = getInternalClsName(cls);
-    boolean fairCheckIsNecessary = !internalClsName.startsWith(JAVA_UTIL_PREFIX);
+  private static boolean isObject(Class<?> cls) {
+    String clsName = getInternalClsName(cls);
+    return OBJECT_CLS_NAME.equals(clsName);
+  }
+
+  private static boolean isStandardLibraryCls(Class<?> cls) {
+    String clsName = getInternalClsName(cls);
+    return clsName.startsWith("java/util/");
+  }
+
+  private static KnownMethodsSet getAllKnownMethods(Class<?> cls, List<Class<?>> clsHierarchyBFS) {
+    boolean fairCheckIsNecessary = !isStandardLibraryCls(cls);
 
     if (fairCheckIsNecessary) {
       return new KnownMethodsSet();
     }
 
-    int index = supers.indexOf(cls);
+    int index = clsHierarchyBFS.indexOf(cls);
     if (index == -1) {
       return new KnownMethodsSet();
     }
 
+    List<Class<?>> clsAndItsParentsBFS = clsHierarchyBFS.subList(index, clsHierarchyBFS.size());
+
+    String clsName = getInternalClsName(cls);
     KnownMethodsSet result = new KnownMethodsSet();
-
-    List<Class<?>> clsAndItsSupers = supers.subList(index, supers.size());
-
-    for (Class<?> superCls : clsAndItsSupers) {
-      KnownMethodsSet knownMethods = myKnownMethods.get(getInternalClsName(superCls));
-      if (knownMethods != null) {
-        result.addAll(knownMethods);
+    for (Class<?> parent : clsAndItsParentsBFS) {
+      String parentClsName = getInternalClsName(parent);
+      KnownMethodsSet knownMethods = myKnownMethods.get(parentClsName);
+      if (knownMethods == null) {
+        continue;
+      }
+      for (KnownMethod method : knownMethods.values()) {
+        if (method.appliesTo(clsName)) {
+          result.add(method);
+        }
       }
     }
 
     return result;
   }
 
-  private static void transformCollectionClassIfNeeded(Class<?> cls) {
+  private static void transformCollectionClassIfNeeded(Class<?> collectionCls) {
     try {
       myTransformLock.lock();
-      myUnprocessedNestedMembers.clear();
+      myUnprocessedNestMates.clear();
       myProcessedClasses.clear();
-      String internalClsName = getInternalClsName(cls);
+      String internalClsName = getInternalClsName(collectionCls);
       if (myCollectionsToTransform.containsKey(internalClsName)) {
         return;
       }
 
-      List<Class<?>> allSupers = getSuperClassesAndInterfaces(cls);
-      Set<String> allSupersNames = getClassesNames(allSupers);
+      String clsName = collectionCls.getName();
 
       for (Class<?> loadedCls : ourInstrumentation.getAllLoadedClasses()) {
-        if (allSupersNames.contains(loadedCls.getName())) {
-          try {
-            String name = getInternalClsName(loadedCls);
-            myCollectionsToTransform.put(name, getAllKnownMethods(loadedCls, allSupers));
-            ourInstrumentation.retransformClasses(loadedCls);
-            myProcessedClasses.add(name);
+        if (clsName.equals(loadedCls.getName())) {
+          List<Class<?>> parents = getClsAndItsParentsBFS(collectionCls);
+          for (Class<?> cls : parents) {
+            myCollectionsToTransform.put(getInternalClsName(cls), getAllKnownMethods(cls, parents));
           }
-          catch (UnmodifiableClassException e) {
-            e.printStackTrace();
+          for (Class<?> cls : parents) {
+            transformClass(cls);
           }
         }
       }
-      transformCollectionNestedMembers();
+      transformCollectionNestMates();
     }
     catch (Exception e) {
-      e.printStackTrace();
+      handleException(e);
     }
     finally {
       myTransformLock.unlock();
     }
   }
 
-  public static void putFieldToCapture(String fieldOwnerClsName, String fieldName, String... classesNames) {
-    Set<String> classesNamesSet = new HashSet<String>(Arrays.asList(classesNames));
+  public static void addFieldToTracked(String fieldOwnerClsName,
+                                       String fieldName,
+                                       String fieldDescriptor,
+                                       String... unprocessedClasses) {
+    myTrackedFields.addField(fieldName, fieldDescriptor);
+    Set<String> classesNamesSet = new HashSet<String>(Arrays.asList(unprocessedClasses));
     for (Class cls : ourInstrumentation.getAllLoadedClasses()) {
       String name = cls.getName();
-      if (classesNamesSet.contains(name)) {
-        putFieldToTrackedIfNeeded(fieldOwnerClsName, fieldName, cls);
-        myClassesToTransform.add(getInternalClsName(cls));
+      if (classesNamesSet.contains(name) && resolve(cls, fieldOwnerClsName, fieldName)) {
+        myTrackedFields.addFieldOwnerForSymbolicReference(getInternalClsName(cls), fieldOwnerClsName, fieldName);
       }
     }
   }
 
-  @SuppressWarnings("unused")
-  public static void emulateFieldWatchpoint(String fieldOwnerClsName, String fieldName, String... unprocessedClasses) {
-    putFieldToCapture(fieldOwnerClsName, fieldName, unprocessedClasses);
+  @SuppressWarnings("unused") // called from debugger
+  public static void emulateFieldWatchpoint(String fieldOwnerClsName,
+                                            String fieldName,
+                                            String fieldDescriptor,
+                                            String... unprocessedClasses) {
+    addFieldToTracked(fieldOwnerClsName, fieldName, fieldDescriptor, unprocessedClasses);
     for (String clsName : unprocessedClasses) {
-      transformClassToCaptureFields(clsName);
+      transformClassToCaptureFieldModifications(clsName);
     }
   }
 
@@ -582,8 +601,8 @@ public class CollectionBreakpointInstrumentor {
   }
 
   @SuppressWarnings("unused")
-  public static Pair createPair(Object key, Object value) {
-    return new Pair(key, value);
+  public static Entry createEntry(Object key, Object value) {
+    return new Entry<>(key, value);
   }
 
   private static class CollectionBreakpointTransformer implements ClassFileTransformer {
@@ -598,15 +617,15 @@ public class CollectionBreakpointInstrumentor {
       }
 
       boolean shouldBeTransformed = myCollectionsToTransform.containsKey(className) ||
-                                    myNestedCollectionMembers.contains(className) ||
-                                    myClassesToTransform.contains(className);
+                                    myCollectionNestMates.contains(className) ||
+                                    myFieldOwnersToTransform.contains(className);
 
       if (shouldBeTransformed) {
         try {
           ClassReader reader = new ClassReader(classfileBuffer);
           ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES);
 
-          MyClassVisitor instrumentor = new MyClassVisitor(className, Opcodes.API_VERSION, writer);
+          CollectionBreakpointClassVisitor instrumentor = new CollectionBreakpointClassVisitor(className, Opcodes.API_VERSION, writer);
           reader.accept(instrumentor, ClassReader.EXPAND_FRAMES);
           byte[] bytes = writer.toByteArray();
 
@@ -624,44 +643,44 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  static class MyClassVisitor extends ClassVisitor {
+  static class CollectionBreakpointClassVisitor extends ClassVisitor {
     private final String myClsName;
 
-    private MyClassVisitor(String clsName, int api, ClassVisitor cv) {
+    private CollectionBreakpointClassVisitor(String clsName, int api, ClassVisitor cv) {
       super(api, cv);
       myClsName = clsName;
     }
 
     @Override
     public void visitNestHost(String nestHost) {
-      saveClassNestMembersToUnprocessed(nestHost);
-      saveCollectionNestMembersToUnprocessed(nestHost);
+      saveClassNestMatesToUnprocessed(nestHost);
+      saveCollectionNestMatesToUnprocessed(nestHost);
       super.visitNestHost(nestHost);
     }
 
     @Override
     public void visitNestMember(String nestMember) {
-      saveClassNestMembersToUnprocessed(nestMember);
-      saveCollectionNestMembersToUnprocessed(nestMember);
+      saveClassNestMatesToUnprocessed(nestMember);
+      saveCollectionNestMatesToUnprocessed(nestMember);
       super.visitNestMember(nestMember);
     }
 
     @Override
     public void visitInnerClass(String name, String outerName, String innerName, int access) {
-      saveCollectionNestMembersToUnprocessed(name);
+      saveCollectionNestMatesToUnprocessed(name);
       super.visitInnerClass(name, outerName, innerName, access);
     }
 
-    private void saveCollectionNestMembersToUnprocessed(String nestMemberName) {
+    private void saveCollectionNestMatesToUnprocessed(String nestMemberName) {
       if ((myCollectionsToTransform.containsKey(myClsName) ||
-           myNestedCollectionMembers.contains(myClsName))) {
-        myUnprocessedNestedMembers.add(nestMemberName); // save for processing after transform
+           myCollectionNestMates.contains(myClsName))) {
+        myUnprocessedNestMates.add(nestMemberName); // save for processing after transform
       }
     }
 
-    private void saveClassNestMembersToUnprocessed(String nestMemberName) {
-      if (myClassesToTransform.contains(myClsName)) {
-        myUnprocessedNestedMembers.add(nestMemberName); // save for processing after transform
+    private void saveClassNestMatesToUnprocessed(String nestMemberName) {
+      if (myFieldOwnersToTransform.contains(myClsName)) {
+        myUnprocessedNestMates.add(nestMemberName); // save for processing after transform
       }
     }
 
@@ -676,7 +695,7 @@ public class CollectionBreakpointInstrumentor {
       boolean isBridgeMethod = (access & Opcodes.ACC_BRIDGE) != 0;
 
       if (!isBridgeMethod && name != null && desc != null) {
-        if (myClassesToTransform.contains(myClsName)) {
+        if (myFieldOwnersToTransform.contains(myClsName)) {
           mv = new CaptureFieldsMethodVisitor(api, mv);
         }
 
@@ -687,17 +706,10 @@ public class CollectionBreakpointInstrumentor {
           mv = getCollectionMethodVisitor(access, name, desc, signature, exceptions, mv);
         }
 
-        Set<String> fieldOwnerTypes = new HashSet<String>();
-        if (myNestedCollectionMembers.contains(myClsName)) {
-          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet()); // support for collection nested classes
-        }
-
-        if (isStaticMethod && myCollectionsToTransform.containsKey(myClsName)) {
-          fieldOwnerTypes.addAll(myCollectionsToTransform.keySet()); // support for collection static methods
-        }
-
-        if (!fieldOwnerTypes.isEmpty()) {
-          mv = new FieldOperationsTracker(api, access, name, desc, signature, exceptions, mv, fieldOwnerTypes);
+        boolean isCollectionNestMate = myCollectionNestMates.contains(myClsName);
+        boolean isCollectionStaticMethod = isStaticMethod && myCollectionsToTransform.containsKey(myClsName);
+        if (isCollectionNestMate || isCollectionStaticMethod) {
+          mv = new FieldOperationsTracker(api, access, name, desc, signature, exceptions, mv);
         }
 
         return mv;
@@ -787,7 +799,6 @@ public class CollectionBreakpointInstrumentor {
 
     private static class FieldOperationsTracker extends MethodNode {
       private final Set<String> myFieldOwnerTypes;
-      private int myAdditionalStackSpace = 0;
 
       protected FieldOperationsTracker(int api,
                                        int access,
@@ -795,39 +806,32 @@ public class CollectionBreakpointInstrumentor {
                                        String desc,
                                        String signature,
                                        String[] exceptions,
-                                       MethodVisitor mv,
-                                       Set<String> fieldOwnerTypes) {
+                                       MethodVisitor mv) {
         super(api, access, name, desc, signature, exceptions);
         this.mv = mv;
-        myFieldOwnerTypes = fieldOwnerTypes;
+        myFieldOwnerTypes = myCollectionsToTransform.keySet();
       }
 
-      private void addEndCaptureCode(InsnList insnList, int collectionCopiesVar) {
+      private static void addEndCaptureCode(InsnList insnList, int collectionCopiesVar) {
         insnList.add(new VarInsnNode(Opcodes.ALOAD, collectionCopiesVar));
         insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                                         getInstrumentorClassName(),
                                         ON_CAPTURE_END_METHOD_NAME,
                                         ON_CAPTURE_END_NESTED_CLS_METHOD_DESC,
                                         false));
-        myAdditionalStackSpace += 2;
       }
 
-      private void putCollectionInstanceOnStack(int fieldInsCode, InsnList insnList) {
+      private static void putCollectionInstanceOnStack(int fieldInsCode, InsnList insnList) {
         if (fieldInsCode == Opcodes.PUTFIELD) {
           insnList.add(new InsnNode(Opcodes.DUP2));
           insnList.add(new InsnNode(Opcodes.POP));
-          myAdditionalStackSpace += 2;
         }
         else if (fieldInsCode == Opcodes.GETFIELD) {
           insnList.add(new InsnNode(Opcodes.DUP));
-          myAdditionalStackSpace += 1;
         }
       }
 
-      private void addStartCaptureCode(int fieldInsCode, InsnList insnList, int collectionCopiesVar) {
-        if (fieldInsCode != Opcodes.PUTFIELD && fieldInsCode != Opcodes.GETFIELD) {
-          return;
-        }
+      private static void addStartCaptureCode(int fieldInsCode, InsnList insnList, int collectionCopiesVar) {
         putCollectionInstanceOnStack(fieldInsCode, insnList);
         insnList.add(new VarInsnNode(Opcodes.ALOAD, collectionCopiesVar));
         insnList.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
@@ -835,7 +839,6 @@ public class CollectionBreakpointInstrumentor {
                                         ON_CAPTURE_START_METHOD_NAME,
                                         ON_CAPTURE_START_NESTED_CLS_METHOD_DESC,
                                         false));
-        myAdditionalStackSpace += 2;
       }
 
       private void addLocalVariables(AbstractInsnNode insertAfterThis, int collectionCopiesVar) {
@@ -853,14 +856,13 @@ public class CollectionBreakpointInstrumentor {
         else {
           insertBeforeFirstIns(instructions, insList);
         }
-
-        myAdditionalStackSpace += 1;
       }
 
-      private boolean containsFieldIns() {
+      private boolean containsInstanceFieldIns() {
         for (AbstractInsnNode node : instructions) {
-          if (node instanceof FieldInsnNode &&
-              (node.getOpcode() == Opcodes.GETFIELD || node.getOpcode() == Opcodes.PUTFIELD)) {
+          int opcode = node.getOpcode();
+          boolean isInstanceFieldOp = opcode == Opcodes.GETFIELD || opcode == Opcodes.PUTFIELD;
+          if (node instanceof FieldInsnNode && isInstanceFieldOp) {
             String fieldOwnerType = ((FieldInsnNode)node).owner;
             if (myFieldOwnerTypes.contains(fieldOwnerType)) {
               return true;
@@ -891,8 +893,8 @@ public class CollectionBreakpointInstrumentor {
           }
 
           int opcode = insNode.getOpcode();
-          if (insNode instanceof FieldInsnNode &&
-              (opcode == Opcodes.GETFIELD || opcode == Opcodes.PUTFIELD)) {
+          boolean isInstanceFieldOp = opcode == Opcodes.GETFIELD || opcode == Opcodes.PUTFIELD;
+          if (insNode instanceof FieldInsnNode && isInstanceFieldOp) {
             String fieldOwnerType = ((FieldInsnNode)insNode).owner;
             if (myFieldOwnerTypes.contains(fieldOwnerType)) {
               processFieldIns(opcode, insNode, collectionCopiesVar);
@@ -916,25 +918,22 @@ public class CollectionBreakpointInstrumentor {
 
       private void addCaptureModificationsCode() {
         boolean isConstructor = CONSTRUCTOR_METHOD_NAME.equals(name);
-        AbstractInsnNode insertAfterThis = isConstructor ? findSuperConstructorCallIns() : null;
+        AbstractInsnNode insertAfterThisIns = isConstructor ? findSuperConstructorCallIns() : null;
 
         int collectionCopiesVar = maxLocals;
 
         MyTryCatchProvider tryCatchProvider = new MyTryCatchProvider(collectionCopiesVar);
-        tryCatchProvider.wrapMethodInTryCatch(this, insertAfterThis);
+        tryCatchProvider.wrapMethodInTryCatch(this, insertAfterThisIns);
 
-        addLocalVariables(insertAfterThis, collectionCopiesVar);
+        addLocalVariables(insertAfterThisIns, collectionCopiesVar);
 
-        addCaptureModificationsCode(insertAfterThis, collectionCopiesVar);
-
-        maxStack += myAdditionalStackSpace;
-        maxLocals += 1;
+        addCaptureModificationsCode(insertAfterThisIns, collectionCopiesVar);
       }
 
       @Override
       public void visitEnd() {
         super.visitEnd();
-        if (containsFieldIns()) {
+        if (containsInstanceFieldIns()) {
           addCaptureModificationsCode();
         }
         accept(mv);
@@ -950,7 +949,7 @@ public class CollectionBreakpointInstrumentor {
         }
       }
 
-      private class MyTryCatchProvider extends TryCatchProvider {
+      private static class MyTryCatchProvider extends TryCatchProvider {
         private final int myCollectionCopiesVar;
 
         private MyTryCatchProvider(int collectionCopiesVar) {
@@ -1008,8 +1007,6 @@ public class CollectionBreakpointInstrumentor {
       private final KnownMethod myDelegate;
       private int myCollectionCopyVar;
       private int myShouldCaptureVar;
-      private int myAdditionalStackSpace = 0;
-      private int myNumberOfAdditionalLocalVars = 0;
 
       protected DefaultCollectionMethodVisitor(int api,
                                                int access,
@@ -1043,11 +1040,6 @@ public class CollectionBreakpointInstrumentor {
         super.visitInsn(opcode);
       }
 
-      @Override
-      public void visitMaxs(int maxStack, int maxLocals) {
-        super.visitMaxs(maxStack + myAdditionalStackSpace, maxLocals + myNumberOfAdditionalLocalVars);
-      }
-
       private void addEndCaptureCode() {
         mv.visitVarInsn(Opcodes.ALOAD, 0);
         mv.visitLdcInsn(shouldSynchronize(myMethodFullDesc));
@@ -1056,7 +1048,6 @@ public class CollectionBreakpointInstrumentor {
                            ON_CAPTURE_END_METHOD_NAME,
                            ON_CAPTURE_END_DEFAULT_METHOD_DESC,
                            false);
-        myAdditionalStackSpace += 1;
       }
 
       private void addStartCaptureCode() {
@@ -1069,8 +1060,6 @@ public class CollectionBreakpointInstrumentor {
                            false);
         myShouldCaptureVar = newLocal(Type.BOOLEAN_TYPE);
         mv.visitVarInsn(Opcodes.ISTORE, myShouldCaptureVar);
-        myAdditionalStackSpace += 2;
-        myNumberOfAdditionalLocalVars += 1;
       }
 
       private void addCaptureCollectionCopyCode() {
@@ -1083,8 +1072,6 @@ public class CollectionBreakpointInstrumentor {
                            false);
         myCollectionCopyVar = newLocal(Type.getType(MULTISET_TYPE));
         mv.visitVarInsn(Opcodes.ASTORE, myCollectionCopyVar);
-        myAdditionalStackSpace += 3;
-        myNumberOfAdditionalLocalVars += 1;
       }
 
       private void addCaptureCollectionModificationDefaultCode() {
@@ -1095,22 +1082,19 @@ public class CollectionBreakpointInstrumentor {
                            CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_NAME,
                            CAPTURE_COLLECTION_MODIFICATION_DEFAULT_METHOD_DESC,
                            false);
-        myAdditionalStackSpace += 2;
       }
 
       private void addCaptureCollectionModificationCode() {
-        if (myDelegate == null || !(myDelegate instanceof DocumentedMethod)) {
-          addCaptureCollectionModificationDefaultCode();
+        if (myDelegate instanceof DocumentedMethod) {
+          ((DocumentedMethod)myDelegate).addCaptureModificationCode(mv, myShouldCaptureVar);
         }
         else {
-          myAdditionalStackSpace += ((DocumentedMethod)myDelegate).addCaptureModificationCode(mv, myShouldCaptureVar);
+          addCaptureCollectionModificationDefaultCode();
         }
       }
     }
 
-    private class CaptureFieldsMethodVisitor extends MethodVisitor {
-      private int myAdditionalStackSpace = 0;
-
+    private static class CaptureFieldsMethodVisitor extends MethodVisitor {
       private CaptureFieldsMethodVisitor(int api, MethodVisitor methodVisitor) {
         super(api, methodVisitor);
       }
@@ -1119,29 +1103,27 @@ public class CollectionBreakpointInstrumentor {
       public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
         boolean isPutOperation = opcode == Opcodes.PUTFIELD || opcode == Opcodes.PUTSTATIC;
         if (isPutOperation) {
-          visitPutField(mv, opcode, owner, name);
+          visitPutField(mv, opcode, owner, name, descriptor);
         }
         super.visitFieldInsn(opcode, owner, name, descriptor);
       }
 
-      private void visitPutField(MethodVisitor mv, int opcode, String fieldOwnerName, String fieldName) {
-        if (myTrackedFields.containsField(fieldName)) {
+      private static void visitPutField(MethodVisitor mv,
+                                        int opcode,
+                                        String fieldOwnerName,
+                                        String fieldName,
+                                        String fieldDescriptor) {
+        if (myTrackedFields.containsField(fieldName, fieldDescriptor)) {
           boolean isStaticField = opcode == Opcodes.PUTSTATIC;
-          addCaptureFieldModificationCode(mv, myClsName, fieldOwnerName, fieldName, isStaticField);
+          addCaptureFieldModificationCode(mv, fieldOwnerName, fieldName, isStaticField);
         }
       }
 
-      @Override
-      public void visitMaxs(int maxStack, int maxLocals) {
-        super.visitMaxs(maxStack + myAdditionalStackSpace, maxLocals);
-      }
-
-      private void addCaptureFieldModificationCode(MethodVisitor mv,
-                                                   String clsName,
-                                                   String fieldOwner,
-                                                   String fieldName,
-                                                   boolean isStaticField) {
-        putThisObjOnStack(mv, clsName, fieldOwner, isStaticField);
+      private static void addCaptureFieldModificationCode(MethodVisitor mv,
+                                                          String fieldOwner,
+                                                          String fieldName,
+                                                          boolean isStaticField) {
+        putCollectionAndClsInstanceOnStack(mv, isStaticField);
         mv.visitLdcInsn(fieldOwner);
         mv.visitLdcInsn(fieldName);
         mv.visitLdcInsn(true);
@@ -1150,23 +1132,17 @@ public class CollectionBreakpointInstrumentor {
                            CAPTURE_FIELD_MODIFICATION_METHOD_NAME,
                            CAPTURE_FIELD_MODIFICATION_METHOD_DESC,
                            false);
-        myAdditionalStackSpace += 3;
       }
 
-      private void putThisObjOnStack(MethodVisitor mv, String clsName, String fieldOwner, boolean isStaticField) {
+      private static void putCollectionAndClsInstanceOnStack(MethodVisitor mv, boolean isStaticField) {
         if (isStaticField) {
-          mv.visitInsn(Opcodes.DUP);
-          mv.visitInsn(Opcodes.ACONST_NULL);
+          mv.visitInsn(Opcodes.DUP); // reference to collection instance
+          mv.visitInsn(Opcodes.ACONST_NULL); // class instance reference is null
         }
-        else if (clsName.equals(fieldOwner)) {
-          mv.visitInsn(Opcodes.DUP);
-          mv.visitVarInsn(Opcodes.ALOAD, 0);
-        }
-        else {
+        else { // last two objects on the stack
           mv.visitInsn(Opcodes.DUP2);
           mv.visitInsn(Opcodes.SWAP);
         }
-        myAdditionalStackSpace += 2;
       }
     }
   }
@@ -1197,52 +1173,15 @@ public class CollectionBreakpointInstrumentor {
     }
   }
 
-  private static class Multiset {
-    private final HashMap<Object, Integer> myContainer = new HashMap<Object, Integer>();
-
-    public void add(Object element) {
-      Integer number = myContainer.get(element);
-      if (number == null) {
-        myContainer.put(element, 1);
-      }
-      else {
-        myContainer.put(element, number + 1);
-      }
-    }
-
-    public Integer get(Object elem) {
-      return myContainer.get(elem);
-    }
-
-    private Set<Map.Entry<Object, Integer>> entrySet() {
-      return myContainer.entrySet();
-    }
-
-    public static Multiset toMultiset(Object collection) {
-      Multiset multiset = new Multiset();
-      if (collection instanceof Collection) {
-        for (Object element : (Collection<?>)collection) {
-          multiset.add(new Wrapper(element));
-        }
-      }
-      else if (collection instanceof Map) {
-        for (Map.Entry<?, ?> element : ((Map<?, ?>)collection).entrySet()) {
-          multiset.add(new Pair(element.getKey(), element.getValue()));
-        }
-      }
-      return multiset;
-    }
-  }
-
-  private static class ConcurrentIdentityHashMap {
+  private static class TrackedCollections {
     private final Map<Object, CollectionInstanceLock> myContainer = new IdentityHashMap<Object, CollectionInstanceLock>();
     private final ReentrantLock myLock = new ReentrantLock();
 
-    public void add(Object obj) {
+    public void add(Object collectionInstance) {
       myLock.lock();
       try {
-        if (!myContainer.containsKey(obj)) {
-          myContainer.put(obj, new CollectionInstanceLock());
+        if (!myContainer.containsKey(collectionInstance)) {
+          myContainer.put(collectionInstance, new CollectionInstanceLock());
         }
       }
       finally {
@@ -1250,10 +1189,10 @@ public class CollectionBreakpointInstrumentor {
       }
     }
 
-    public CollectionInstanceLock get(Object obj) {
+    public CollectionInstanceLock get(Object collectionInstance) {
       myLock.lock();
       try {
-        return myContainer.get(obj);
+        return myContainer.get(collectionInstance);
       }
       finally {
         myLock.unlock();
@@ -1267,12 +1206,7 @@ public class CollectionBreakpointInstrumentor {
 
     public boolean lock(boolean shouldSynchronized) {
       if (shouldSynchronized) {
-        try {
-          myLock.tryLock(10, TimeUnit.MINUTES);
-        }
-        catch (InterruptedException e) {
-          e.printStackTrace();
-        }
+        myLock.lock();
       }
       Integer methodEnterNumber = getMethodEnterNumber();
       setMethodEnterNumber(methodEnterNumber + 1);
@@ -1300,86 +1234,32 @@ public class CollectionBreakpointInstrumentor {
         }
       }
       catch (Throwable e) {
-        e.printStackTrace();
+        handleException(e);
       }
     }
   }
 
-  private static class Wrapper {
-    private final Object value;
-
-    private Wrapper(Object value) {
-      this.value = value;
-    }
-
-    private Object getValue() {
-      return value;
-    }
-
-    @Override
-    public boolean equals(Object obj) {
-      return obj instanceof Wrapper &&
-             value == ((Wrapper)obj).value;
-    }
-
-    @Override
-    public int hashCode() {
-      return System.identityHashCode(value);
-    }
-  }
-
   private static class TrackedFields {
+    private static final String SEPARATOR = "->";
     private final HashMap<String, String> fieldOwners = new HashMap<String, String>();
     private final HashSet<String> fieldNames = new HashSet<String>();
 
-    public void addField(String fieldOwnerName, String internalClsName, String fieldName) {
-      fieldOwners.put(internalClsName + fieldName, fieldOwnerName);
-      fieldNames.add(fieldName);
+    public void addField(String fieldName, String fieldDescriptor) {
+      fieldNames.add(fieldName + SEPARATOR + fieldDescriptor);
     }
 
-    public boolean containsField(String fieldName) {
-      return fieldNames.contains(fieldName);
+    public void addFieldOwnerForSymbolicReference(String clsSymbolicReference,
+                                                  String fieldOwnerName,
+                                                  String fieldName) {
+      fieldOwners.put(clsSymbolicReference + SEPARATOR + fieldName, fieldOwnerName);
     }
 
-    public String getFieldOwnerName(String internalClsName, String fieldName) {
-      return fieldOwners.get(internalClsName + fieldName);
-    }
-  }
-
-  public static class Pair implements Map.Entry<Object, Object> {
-    private final Object key;
-    private final Object value;
-
-    private Pair(Object key, Object value) {
-      this.key = key;
-      this.value = value;
+    public boolean containsField(String fieldName, String fieldDescriptor) {
+      return fieldNames.contains(fieldName + SEPARATOR + fieldDescriptor);
     }
 
-    @Override
-    public Object getKey() {
-      return key;
-    }
-
-    @Override
-    public Object getValue() {
-      return value;
-    }
-
-    @Override
-    public Object setValue(Object value) {
-      return null;
-    }
-
-    @Override
-    public boolean equals(Object obj) {
-      return obj instanceof Pair &&
-             ((Pair)obj).key == key &&
-             ((Pair)obj).value == value;
-    }
-
-    @Override
-    public int hashCode() {
-      return System.identityHashCode(key) + 31 * System.identityHashCode(key);
+    public String getFieldOwnerName(String clsSymbolicReference, String fieldName) {
+      return fieldOwners.get(clsSymbolicReference + SEPARATOR + fieldName);
     }
   }
 
@@ -1392,10 +1272,8 @@ public class CollectionBreakpointInstrumentor {
       }
     }
 
-    public void addAll(KnownMethodsSet set) {
-      for (KnownMethod method : set.myContainer.values()) {
-        add(method);
-      }
+    public Collection<KnownMethod> values() {
+      return myContainer.values();
     }
 
     public KnownMethod get(String methodFullDesc) {
@@ -1403,59 +1281,86 @@ public class CollectionBreakpointInstrumentor {
     }
 
     @Override
-    public boolean equals(Object obj) {
-      return obj instanceof KnownMethodsSet && myContainer.equals(((KnownMethodsSet)obj).myContainer);
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      KnownMethodsSet set = (KnownMethodsSet)o;
+      return Objects.equals(myContainer, set.myContainer);
     }
 
     @Override
     public int hashCode() {
-      return myContainer.hashCode();
+      return Objects.hash(myContainer);
     }
   }
 
   private abstract static class KnownMethod {
+    private final String myClsName;
     private final String myMethodFullDesc;
+    private final boolean myAppliesToOverridden;
 
-    private KnownMethod(String desc) {
+    private KnownMethod(String clsName, String desc, boolean appliesToOverridden) {
+      myClsName = clsName;
       myMethodFullDesc = desc;
+      myAppliesToOverridden = appliesToOverridden;
+    }
+
+    private KnownMethod(String clsName, String desc) {
+      this(clsName, desc, true);
+    }
+
+    public boolean appliesToOverridden() {
+      return myAppliesToOverridden;
+    }
+
+    public boolean appliesTo(String clsOrInheritorType) {
+      if (appliesToOverridden()) {
+        return true;
+      }
+      return myClsName.equals(clsOrInheritorType);
     }
 
     @Override
-    public boolean equals(Object obj) {
-      return obj instanceof KnownMethod && myMethodFullDesc.equals(((KnownMethod)obj).myMethodFullDesc);
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      KnownMethod method = (KnownMethod)o;
+      return myAppliesToOverridden == method.myAppliesToOverridden &&
+             myClsName.equals(method.myClsName) &&
+             myMethodFullDesc.equals(method.myMethodFullDesc);
     }
 
     @Override
     public int hashCode() {
-      return myMethodFullDesc.hashCode();
+      return Objects.hash(myClsName, myMethodFullDesc, myAppliesToOverridden);
     }
   }
 
   private static class ImmutableMethod extends KnownMethod {
-    private ImmutableMethod(String desc) {
-      super(desc);
+    private ImmutableMethod(String clsName, String desc) {
+      super(clsName, desc);
     }
   }
 
   private static abstract class DocumentedMethod extends KnownMethod {
-    private DocumentedMethod(String desc) {
-      super(desc);
+    private DocumentedMethod(String clsName, String desc) {
+      super(clsName, desc);
     }
 
-    public abstract int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar);
+    public abstract void addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar);
   }
 
   private static abstract class ReplaceableMethod extends KnownMethod {
-    private ReplaceableMethod(String desc) {
-      super(desc);
+    private ReplaceableMethod(String clsName, String desc) {
+      super(clsName, desc, false);
     }
 
     public abstract MethodVisitor getMethodVisitor(int api, MethodVisitor superMethodVisitor);
   }
 
   private static class AddAllMethod extends ReplaceableMethod {
-    private AddAllMethod() {
-      super("addAll(Ljava/util/Collection;)Z");
+    private AddAllMethod(String clsName) {
+      super(clsName, "addAll(Ljava/util/Collection;)Z");
     }
 
     @Override
@@ -1480,8 +1385,8 @@ public class CollectionBreakpointInstrumentor {
   }
 
   private static class RemoveAllMethod extends ReplaceableMethod {
-    private RemoveAllMethod() {
-      super("removeAll(Ljava/util/Collection;)Z");
+    private RemoveAllMethod(String clsName) {
+      super(clsName, "removeAll(Ljava/util/Collection;)Z");
     }
 
     @Override
@@ -1508,13 +1413,13 @@ public class CollectionBreakpointInstrumentor {
   private static class ReturnsBooleanMethod extends DocumentedMethod {
     private final boolean myIsAddition;
 
-    private ReturnsBooleanMethod(String desc, boolean isAddition) {
-      super(desc);
+    private ReturnsBooleanMethod(String clsName, String desc, boolean isAddition) {
+      super(clsName, desc);
       myIsAddition = isAddition;
     }
 
     @Override
-    public int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
+    public void addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
       mv.visitInsn(Opcodes.DUP);
       mv.visitVarInsn(Opcodes.ILOAD, shouldCaptureVar);
       mv.visitInsn(Opcodes.SWAP);
@@ -1526,17 +1431,16 @@ public class CollectionBreakpointInstrumentor {
                          CAPTURE_COLLECTION_MODIFICATION_METHOD_NAME,
                          CAPTURE_COLLECTION_MODIFICATION_METHOD_DESC,
                          false);
-      return 5;
     }
   }
 
   private static class PutMethod extends DocumentedMethod {
-    private PutMethod() {
-      super("put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    private PutMethod(String clsName) {
+      super(clsName, "put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
     }
 
     @Override
-    public int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
+    public void addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
       mv.visitInsn(Opcodes.DUP);
       mv.visitVarInsn(Opcodes.ALOAD, 2);
       Label label = new Label();
@@ -1553,8 +1457,8 @@ public class CollectionBreakpointInstrumentor {
       mv.visitVarInsn(Opcodes.ALOAD, 2);
       mv.visitMethodInsn(Opcodes.INVOKESTATIC,
                          getInstrumentorClassName(),
-                         CREATE_PAIR_METHOD_NAME,
-                         CREATE_PAIR_METHOD_DESC,
+                         CREATE_ENTRY_METHOD_NAME,
+                         CREATE_ENTRY_METHOD_DESC,
                          false);
       mv.visitVarInsn(Opcodes.ALOAD, 0);
       mv.visitInsn(Opcodes.SWAP);
@@ -1564,17 +1468,16 @@ public class CollectionBreakpointInstrumentor {
                          CAPTURE_COLLECTION_MODIFICATION_METHOD_NAME,
                          CAPTURE_COLLECTION_MODIFICATION_METHOD_DESC,
                          false);
-      return 6;
     }
   }
 
   private static class RemoveKeyMethod extends DocumentedMethod {
-    private RemoveKeyMethod() {
-      super("remove(Ljava/lang/Object;)Ljava/lang/Object;");
+    private RemoveKeyMethod(String clsName) {
+      super(clsName, "remove(Ljava/lang/Object;)Ljava/lang/Object;");
     }
 
     @Override
-    public int addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
+    public void addCaptureModificationCode(MethodVisitor mv, int shouldCaptureVar) {
       mv.visitInsn(Opcodes.DUP);
       mv.visitInsn(Opcodes.DUP);
       Label label = new Label();
@@ -1594,8 +1497,8 @@ public class CollectionBreakpointInstrumentor {
       mv.visitInsn(Opcodes.SWAP);
       mv.visitMethodInsn(Opcodes.INVOKESTATIC,
                          getInstrumentorClassName(),
-                         CREATE_PAIR_METHOD_NAME,
-                         CREATE_PAIR_METHOD_DESC,
+                         CREATE_ENTRY_METHOD_NAME,
+                         CREATE_ENTRY_METHOD_DESC,
                          false);
       mv.visitVarInsn(Opcodes.ALOAD, 0);
       mv.visitInsn(Opcodes.SWAP);
@@ -1605,7 +1508,6 @@ public class CollectionBreakpointInstrumentor {
                          CAPTURE_COLLECTION_MODIFICATION_METHOD_NAME,
                          CAPTURE_COLLECTION_MODIFICATION_METHOD_DESC,
                          false);
-      return 7;
     }
   }
 }

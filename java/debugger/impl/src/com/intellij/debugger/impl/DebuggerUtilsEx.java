@@ -425,7 +425,10 @@ public abstract class DebuggerUtilsEx extends DebuggerUtils {
       }
       JavaValue parent = ((JavaValue)container).getParent();
       if (parent != null) {
-        return parent.getDescriptor().getIdLabel();
+        Value value = parent.getDescriptor().getValue();
+        if (value instanceof ObjectReference ref) {
+          return StringUtil.getShortName(ref.referenceType().name()) + "@" + ref.uniqueID();
+        }
       }
     }
     return null;

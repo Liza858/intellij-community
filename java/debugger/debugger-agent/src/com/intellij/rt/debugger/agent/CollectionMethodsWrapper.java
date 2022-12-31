@@ -1,7 +1,5 @@
 // Copyright 2000-2022 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
-package com.intellij.rt.debugger.agent.util;
-
-import com.intellij.rt.debugger.agent.CollectionBreakpointInstrumentor;
+package com.intellij.rt.debugger.agent;
 
 import java.util.Collection;
 
